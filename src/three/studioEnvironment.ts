@@ -107,46 +107,46 @@ function createProceduralStudioIblMap(maxAnisotropy: number): THREE.DataTexture 
       const dx = -Math.sin(theta) * sinPhi;
       const dz = -Math.cos(theta) * sinPhi;
 
-      // Ambient dark studio cyclorama floor & ceiling base
+      // Ambient dark studio cyclorama floor & ceiling base (subtle cool slate bias)
       const skyGrad = smoothstep(-0.35, 0.75, dy);
-      let r = 0.024 + 0.032 * skyGrad;
-      let g = 0.026 + 0.035 * skyGrad;
-      let b = 0.033 + 0.044 * skyGrad;
+      let r = 0.022 + 0.029 * skyGrad;
+      let g = 0.025 + 0.034 * skyGrad;
+      let b = 0.034 + 0.046 * skyGrad;
 
-      // 1. Overhead-left/front primary diffused softbox bank (3:1 key source)
+      // 1. Overhead-left/front primary diffused softbox bank (3:1 crisp neutral-warm key source)
       const overheadRaw = evalSoftboxDir(dx, dy, dz, -0.44, 0.76, 0.48, 0.85, 0.56, 0.14);
       if (overheadRaw > 0.001) {
         // Subtle dark structural louver cross-bars in the softbox bank
         const louverX = smoothstep(0.02, 0.065, Math.abs(dx + 0.44));
         const louverZ = smoothstep(0.02, 0.065, Math.abs(dz - 0.48));
         const bankMask = overheadRaw * (0.48 + 0.52 * louverX * louverZ);
-        r += bankMask * 2.20;
-        g += bankMask * 2.22;
-        b += bankMask * 2.26;
+        r += bankMask * 2.26;
+        g += bankMask * 2.21;
+        b += bankMask * 2.13;
       }
 
-      // 2a. Left-side vertical architectural strip light (crisp edge kick)
+      // 2a. Left-side vertical architectural strip light (crisp warm-neutral edge kick)
       const rimStripA = evalSoftboxDir(dx, dy, dz, -0.82, 0.34, 0.44, 0.16, 0.88, 0.08);
       if (rimStripA > 0.001) {
-        r += rimStripA * 2.05;
+        r += rimStripA * 2.10;
         g += rimStripA * 2.08;
-        b += rimStripA * 2.15;
+        b += rimStripA * 2.04;
       }
 
       // 2b. Subtle cool opposite fill strip (restrained ~3:1 contrast)
       const rimStripB = evalSoftboxDir(dx, dy, dz, 0.78, 0.28, -0.56, 0.18, 0.72, 0.10);
       if (rimStripB > 0.001) {
-        r += rimStripB * 0.48;
-        g += rimStripB * 0.54;
-        b += rimStripB * 0.66;
+        r += rimStripB * 0.44;
+        g += rimStripB * 0.51;
+        b += rimStripB * 0.65;
       }
 
       // 3. Low grazing horizon bounce strip (catches bay ripples & Sails Pavilion curves)
       const horizonStrip = evalSoftboxDir(dx, dy, dz, -0.48, 0.20, 0.85, 1.15, 0.18, 0.09);
       if (horizonStrip > 0.001) {
-        r += horizonStrip * 0.88;
+        r += horizonStrip * 0.89;
         g += horizonStrip * 0.90;
-        b += horizonStrip * 0.95;
+        b += horizonStrip * 0.94;
       }
 
       // 4. Dark negative-fill studio flags on opposite shadow side for rich 3:1 contrast
@@ -275,23 +275,23 @@ export function createStudioLightingRig(
   if (!isSoftwareGl) {
     RectAreaLightUniformsLib.init();
 
-    keySoftbox = new THREE.RectAreaLight(0xf6f7fb, 4.2, 16, 10);
+    keySoftbox = new THREE.RectAreaLight(0xfaf7f2, 4.2, 16, 10);
     keySoftbox.position.set(-7, 16, 6);
     keySoftbox.lookAt(0, 1.5, 0);
     scene.add(keySoftbox);
 
-    rimSoftbox = new THREE.RectAreaLight(0xffffff, 5.5, 4.5, 20);
+    rimSoftbox = new THREE.RectAreaLight(0xfcfaf6, 5.5, 4.5, 20);
     rimSoftbox.position.set(-14, 8, -12);
     rimSoftbox.lookAt(0, 2.5, 0);
     scene.add(rimSoftbox);
 
-    fillSoftbox = new THREE.RectAreaLight(0xc8d0dc, 2.2, 4.0, 16);
+    fillSoftbox = new THREE.RectAreaLight(0xc2ccd9, 2.2, 4.0, 16);
     fillSoftbox.position.set(14, 6, 11);
     fillSoftbox.lookAt(0, 1.0, 0);
     scene.add(fillSoftbox);
 
     // Subtle soft shadow caster only for grounding shadows on GPU
-    shadowKeyLight = new THREE.DirectionalLight(0xf3f5f8, 0.42);
+    shadowKeyLight = new THREE.DirectionalLight(0xf8f5ef, 0.42);
     shadowKeyLight.position.set(-10, 18, 8);
     shadowKeyLight.castShadow = true;
     shadowKeyLight.shadow.mapSize.set(1024, 1024);

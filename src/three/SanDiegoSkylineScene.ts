@@ -7,6 +7,7 @@ import {
   LIGHTING_PRESETS,
   LightingPresetId,
   TowerSpec,
+  classifyMidRiseBlock,
   generateCityGridBlocks,
   generateSeawallLights,
   seawallZ,
@@ -28,6 +29,7 @@ import {
   createMatteSlateMaterial,
   createSailFabricMaterial,
   createSdfGlassMaterial,
+  createShadowDepthMaterial,
 } from './shaders/skylineShaders';
 
 export interface SkylineController {
@@ -70,6 +72,8 @@ function detectSoftwareWebGL(): boolean {
 }
 
 const _blackBg = new THREE.Color(0x000000);
+const _shadowClearColor = new THREE.Color(0xffffff);
+const _shadowMatrix = new THREE.Matrix4();
 
 function addRoofParapetAndHvac(
   group: THREE.Group,
@@ -721,7 +725,16 @@ export function createSanDiegoSkylineScene(
     textures.microImperfectionMap,
     lightingRig.studioIblMap,
     BASIN_RADIUS,
-    0x1c1e24,
+    { baseColor: 0x1c1e24, masonryWindows: false },
+  );
+
+  const masonrySlateMat = createMatteSlateMaterial(
+    textures.architecturalGrainMap,
+    textures.groundContactAoMap,
+    textures.microImperfectionMap,
+    lightingRig.studioIblMap,
+    BASIN_RADIUS,
+    { baseColor: 0x22252d, masonryWindows: true },
   );
 
   const brushedMetalMat = createAnisotropicMetalMaterial(
@@ -826,6 +839,33 @@ export function createSanDiegoSkylineScene(
   waterMesh.position.y = WATER_Y;
   dioramaRoot.add(waterMesh);
 
+  // 3b. Real-Time Orthographic Key Shadow Map (1024 GPU / 768 SwiftShader, 16-bit RG depth + 3x3 PCF)
+  const shadowRes = isSoftwareGl ? 768 : 1024;
+  const shadowTarget = new THREE.WebGLRenderTarget(shadowRes, shadowRes, {
+    minFilter: THREE.NearestFilter,
+    magFilter: THREE.NearestFilter,
+    type: THREE.UnsignedByteType,
+    format: THREE.RGBAFormat,
+    depthBuffer: true,
+  });
+  const shadowCamera = new THREE.OrthographicCamera(-15.5, 15.5, 15.5, -15.5, 2.0, 52.0);
+  const shadowDepthMat = createShadowDepthMaterial();
+
+  const shadowReceiverMats = [
+    heroGlassMat,
+    urbanGridGlassMat,
+    matteSlateMat,
+    masonrySlateMat,
+    brushedMetalMat,
+    waterMat,
+    landMat,
+  ];
+  for (const m of shadowReceiverMats) {
+    m.uniforms.uShadowMap.value = shadowTarget.texture;
+    m.uniforms.uShadowTexelSize.value.set(1 / shadowRes, 1 / shadowRes);
+    m.uniforms.uHasShadowMap.value = 1.0;
+  }
+
   // 4. Hero San Diego Landmarks
   const skylineGroup = new THREE.Group();
   dioramaRoot.add(skylineGroup);
@@ -848,64 +888,134 @@ export function createSanDiegoSkylineScene(
   // USS Midway & Navy Pier
   skylineGroup.add(buildMidwayPier(brushedMetalMat, matteSlateMat));
 
-  // 5. Downtown Urban Grid (InstancedMesh curtain-wall glass + recessed parapet lips + HVAC penthouses)
+  // 5. Downtown Urban Grid: Architectural Differentiation (Glossy Curtain-Wall Glass vs Dead-Matte Masonry Slate,
+  //    varied parapet lips, stepped mechanical penthouses, and mixed slate/metallic rooftop HVAC units)
   const unitBoxGeo = new THREE.BoxGeometry(1, 1, 1);
-  const cityInstanced = new THREE.InstancedMesh(unitBoxGeo, urbanGridGlassMat, cityBlocks.length);
-  cityInstanced.castShadow = !isSoftwareGl;
-  cityInstanced.receiveShadow = true;
-
   const parapetGeo = createUnitParapetGeometry();
-  const parapetInstanced = new THREE.InstancedMesh(parapetGeo, matteSlateMat, cityBlocks.length);
-  const hvacInstanced = new THREE.InstancedMesh(unitBoxGeo, matteSlateMat, cityBlocks.length * 2);
 
-  for (let i = 0; i < cityBlocks.length; i++) {
-    const b = cityBlocks[i];
+  const blockSpecs = cityBlocks.map((b, i) => ({
+    block: b,
+    arch: classifyMidRiseBlock(i, b),
+  }));
+  const glassCount = blockSpecs.filter((s) => s.arch.facadeMaterial === 'curtain-glass').length;
+  const slateCount = blockSpecs.length - glassCount;
+  const penthouseCount = blockSpecs.filter((s) => s.arch.hasMechanicalPenthouse).length;
+  const slateHvacTotal = blockSpecs.reduce(
+    (acc, s) => acc + (s.arch.hasMetallicHvac ? 1 : s.arch.hvacCount),
+    0,
+  );
+  const metalHvacTotal = blockSpecs.reduce(
+    (acc, s) => acc + (s.arch.hasMetallicHvac && s.arch.hvacCount === 2 ? 1 : s.arch.hasMetallicHvac ? 1 : 0),
+    0,
+  );
+
+  const cityGlassInstanced = new THREE.InstancedMesh(
+    unitBoxGeo,
+    urbanGridGlassMat,
+    Math.max(1, glassCount),
+  );
+  const citySlateInstanced = new THREE.InstancedMesh(
+    unitBoxGeo,
+    masonrySlateMat,
+    Math.max(1, slateCount),
+  );
+  const parapetInstanced = new THREE.InstancedMesh(parapetGeo, matteSlateMat, cityBlocks.length);
+  const penthouseInstanced = new THREE.InstancedMesh(
+    unitBoxGeo,
+    matteSlateMat,
+    Math.max(1, penthouseCount),
+  );
+  const hvacSlateInstanced = new THREE.InstancedMesh(
+    unitBoxGeo,
+    matteSlateMat,
+    Math.max(1, slateHvacTotal),
+  );
+  const hvacMetalInstanced = new THREE.InstancedMesh(
+    unitBoxGeo,
+    brushedMetalMat,
+    Math.max(1, metalHvacTotal),
+  );
+
+  let glassIdx = 0;
+  let slateIdx = 0;
+  let pentIdx = 0;
+  let hvacSlateIdx = 0;
+  let hvacMetalIdx = 0;
+
+  for (let i = 0; i < blockSpecs.length; i++) {
+    const { block: b, arch } = blockSpecs[i];
     _scratchPos.set(b.x, 0.08 + b.height * 0.5, b.z);
     _scratchEuler.set(0, b.rotationY, 0);
     _scratchQuat.setFromEuler(_scratchEuler);
     _scratchScale.set(b.width, b.height, b.depth);
     _scratchMat4.compose(_scratchPos, _scratchQuat, _scratchScale);
-    cityInstanced.setMatrixAt(i, _scratchMat4);
 
-    // Recessed perimeter parapet lip around every flat mid-rise roof
-    const parapetH = Math.min(0.11, Math.max(0.055, b.height * 0.045));
+    if (arch.facadeMaterial === 'curtain-glass') {
+      cityGlassInstanced.setMatrixAt(glassIdx++, _scratchMat4);
+    } else {
+      citySlateInstanced.setMatrixAt(slateIdx++, _scratchMat4);
+    }
+
+    // Varied perimeter parapet lip around every mid-rise roof
     _scratchPos.set(b.x, 0.08 + b.height, b.z);
-    _scratchScale.set(b.width, parapetH, b.depth);
+    _scratchScale.set(b.width, arch.parapetHeight, b.depth);
     _scratchMat4.compose(_scratchPos, _scratchQuat, _scratchScale);
     parapetInstanced.setMatrixAt(i, _scratchMat4);
 
-    // 2 deterministic HVAC / rooftop mechanical penthouse boxes inside parapet
     const cosR = Math.cos(b.rotationY);
     const sinR = Math.sin(b.rotationY);
-    const offAx = b.width * 0.16;
-    const offAz = b.depth * 0.14;
-    const hvacAH = parapetH * 1.45;
+    let roofBaseY = 0.08 + b.height;
+
+    if (arch.hasMechanicalPenthouse) {
+      _scratchPos.set(b.x, roofBaseY + arch.penthouseHeight * 0.5, b.z);
+      _scratchScale.set(b.width * 0.52, arch.penthouseHeight, b.depth * 0.52);
+      _scratchMat4.compose(_scratchPos, _scratchQuat, _scratchScale);
+      penthouseInstanced.setMatrixAt(pentIdx++, _scratchMat4);
+      roofBaseY += arch.penthouseHeight;
+    }
+
+    // Varied rooftop HVAC / cooling units (slate or satin metal enclosures)
+    const offAx = b.width * (arch.hasMechanicalPenthouse ? 0.11 : 0.16);
+    const offAz = b.depth * (arch.hasMechanicalPenthouse ? 0.10 : 0.14);
+    const hvacAH = arch.parapetHeight * 1.42;
     _scratchPos.set(
       b.x + offAx * cosR + offAz * sinR,
-      0.08 + b.height + hvacAH * 0.5,
+      roofBaseY + hvacAH * 0.5,
       b.z - offAx * sinR + offAz * cosR,
     );
-    _scratchScale.set(b.width * 0.28, hvacAH, b.depth * 0.26);
+    _scratchScale.set(b.width * 0.24, hvacAH, b.depth * 0.24);
     _scratchMat4.compose(_scratchPos, _scratchQuat, _scratchScale);
-    hvacInstanced.setMatrixAt(i * 2, _scratchMat4);
+    if (arch.hasMetallicHvac) {
+      hvacMetalInstanced.setMatrixAt(hvacMetalIdx++, _scratchMat4);
+    } else {
+      hvacSlateInstanced.setMatrixAt(hvacSlateIdx++, _scratchMat4);
+    }
 
-    const hvacBH = parapetH * 0.95;
-    _scratchPos.set(
-      b.x - offAx * cosR - offAz * sinR,
-      0.08 + b.height + hvacBH * 0.5,
-      b.z + offAx * sinR - offAz * cosR,
-    );
-    _scratchScale.set(b.width * 0.18, hvacBH, b.depth * 0.20);
-    _scratchMat4.compose(_scratchPos, _scratchQuat, _scratchScale);
-    hvacInstanced.setMatrixAt(i * 2 + 1, _scratchMat4);
+    if (arch.hvacCount === 2) {
+      const hvacBH = arch.parapetHeight * 0.92;
+      _scratchPos.set(
+        b.x - offAx * cosR - offAz * sinR,
+        roofBaseY + hvacBH * 0.5,
+        b.z + offAx * sinR - offAz * cosR,
+      );
+      _scratchScale.set(b.width * 0.17, hvacBH, b.depth * 0.19);
+      _scratchMat4.compose(_scratchPos, _scratchQuat, _scratchScale);
+      hvacSlateInstanced.setMatrixAt(hvacSlateIdx++, _scratchMat4);
+    }
   }
-  cityInstanced.instanceMatrix.needsUpdate = true;
-  cityInstanced.computeBoundingSphere();
-  parapetInstanced.instanceMatrix.needsUpdate = true;
-  parapetInstanced.computeBoundingSphere();
-  hvacInstanced.instanceMatrix.needsUpdate = true;
-  hvacInstanced.computeBoundingSphere();
-  skylineGroup.add(cityInstanced, parapetInstanced, hvacInstanced);
+
+  for (const inst of [
+    cityGlassInstanced,
+    citySlateInstanced,
+    parapetInstanced,
+    penthouseInstanced,
+    hvacSlateInstanced,
+    hvacMetalInstanced,
+  ]) {
+    inst.instanceMatrix.needsUpdate = true;
+    inst.computeBoundingSphere();
+    skylineGroup.add(inst);
+  }
 
   // 6. Embarcadero Waterfront Promenade Streetlights (InstancedMesh)
   const poleGeo = new THREE.CylinderGeometry(0.018, 0.024, 0.28, 6);
@@ -1186,6 +1296,7 @@ export function createSanDiegoSkylineScene(
       heroGlassMat,
       urbanGridGlassMat,
       matteSlateMat,
+      masonrySlateMat,
       brushedMetalMat,
       plinthMetalMat,
       waterMat,
@@ -1243,6 +1354,51 @@ export function createSanDiegoSkylineScene(
     controls.update();
   }
 
+  function renderShadowPass() {
+    shadowCamera.position.copy(_scratchDir).multiplyScalar(24.0);
+    shadowCamera.position.y = Math.max(8.0, shadowCamera.position.y);
+    shadowCamera.up.set(0, 1, 0);
+    shadowCamera.lookAt(0, 1.5, 0);
+    shadowCamera.updateMatrixWorld();
+
+    _shadowMatrix.multiplyMatrices(shadowCamera.projectionMatrix, shadowCamera.matrixWorldInverse);
+    for (const m of shadowReceiverMats) {
+      m.uniforms.uShadowMatrix.value.copy(_shadowMatrix);
+    }
+
+    const prevOverride = scene.overrideMaterial;
+    const prevBg = scene.background;
+    const prevFog = scene.fog;
+    const prevClearAlpha = renderer.getClearAlpha();
+
+    waterMesh.visible = false;
+    landmass.visible = false;
+    plinth.visible = false;
+    rimRing.visible = false;
+    cycloramaMesh.visible = false;
+
+    scene.background = null;
+    scene.fog = null;
+    scene.overrideMaterial = shadowDepthMat;
+
+    renderer.setRenderTarget(shadowTarget);
+    renderer.setClearColor(_shadowClearColor, 1);
+    renderer.clear();
+    renderer.render(scene, shadowCamera);
+    renderer.setRenderTarget(null);
+    renderer.setClearColor(0x000000, prevClearAlpha);
+
+    scene.overrideMaterial = prevOverride;
+    scene.background = prevBg;
+    scene.fog = prevFog;
+
+    waterMesh.visible = true;
+    landmass.visible = true;
+    plinth.visible = true;
+    rimRing.visible = true;
+    cycloramaMesh.visible = true;
+  }
+
   function renderReflectionPass() {
     const worldWaterY = WATER_Y + dioramaRoot.position.y;
     reflectCamera.fov = camera.fov;
@@ -1271,6 +1427,7 @@ export function createSanDiegoSkylineScene(
     heroGlassMat.uniforms.uIsReflectPass.value = 1.0;
     urbanGridGlassMat.uniforms.uIsReflectPass.value = 1.0;
     matteSlateMat.uniforms.uIsReflectPass.value = 1.0;
+    masonrySlateMat.uniforms.uIsReflectPass.value = 1.0;
     brushedMetalMat.uniforms.uIsReflectPass.value = 1.0;
 
     waterMesh.visible = false;
@@ -1301,10 +1458,12 @@ export function createSanDiegoSkylineScene(
     heroGlassMat.uniforms.uIsReflectPass.value = 0.0;
     urbanGridGlassMat.uniforms.uIsReflectPass.value = 0.0;
     matteSlateMat.uniforms.uIsReflectPass.value = 0.0;
+    masonrySlateMat.uniforms.uIsReflectPass.value = 0.0;
     brushedMetalMat.uniforms.uIsReflectPass.value = 0.0;
   }
 
   function renderFrame(dt: number) {
+    renderShadowPass();
     renderReflectionPass();
     const focusDistance = camera.position.distanceTo(DEFAULT_CAMERA_TARGET);
     postProcessor.render(scene, camera, dt, focusDistance, []);
@@ -1456,6 +1615,8 @@ export function createSanDiegoSkylineScene(
       }
     });
 
+    shadowTarget.dispose();
+    shadowDepthMat.dispose();
     reflectionTarget.dispose();
     textures.dispose();
     lightingRig.dispose();

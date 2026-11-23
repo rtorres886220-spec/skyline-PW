@@ -271,6 +271,51 @@ export function generateCityGridBlocks(seed = 2026): TowerSpec[] {
   return blocks;
 }
 
+export interface MidRiseArchitectureSpec {
+  facadeMaterial: 'curtain-glass' | 'masonry-slate';
+  parapetHeight: number;
+  hasMechanicalPenthouse: boolean;
+  penthouseHeight: number;
+  hvacCount: 1 | 2;
+  hasMetallicHvac: boolean;
+}
+
+/**
+ * Deterministically assigns material separation (glossy curtain-wall glass vs dead-matte
+ * dark slate/limestone masonry), varied parapet heights, and rooftop mechanical units
+ * across mid-rise blocks so adjacent parcels break up repetitive silhouettes.
+ */
+export function classifyMidRiseBlock(index: number, block: TowerSpec): MidRiseArchitectureSpec {
+  const rng = createSeededRng(2026 + index * 7919);
+  const matRoll = rng();
+  const parapetRoll = rng();
+  const penthouseRoll = rng();
+  const hvacRoll = rng();
+  const metalRoll = rng();
+
+  const facadeMaterial: 'curtain-glass' | 'masonry-slate' =
+    block.height >= 2.85 || matRoll > 0.46 ? 'curtain-glass' : 'masonry-slate';
+
+  const parapetHeight =
+    facadeMaterial === 'masonry-slate'
+      ? Math.min(0.145, Math.max(0.068, block.height * (0.042 + parapetRoll * 0.032)))
+      : Math.min(0.095, Math.max(0.042, block.height * (0.025 + parapetRoll * 0.020)));
+
+  const hasMechanicalPenthouse = block.style === 'stepped' || penthouseRoll > 0.62;
+  const penthouseHeight = hasMechanicalPenthouse
+    ? Math.min(0.42, Math.max(0.16, block.height * (0.11 + parapetRoll * 0.06)))
+    : 0;
+
+  return {
+    facadeMaterial,
+    parapetHeight,
+    hasMechanicalPenthouse,
+    penthouseHeight,
+    hvacCount: hvacRoll > 0.34 ? 2 : 1,
+    hasMetallicHvac: metalRoll > 0.52,
+  };
+}
+
 export function generateSeawallLights(count = 30): StreetlightSpec[] {
   const lights: StreetlightSpec[] = [];
   for (let i = 0; i < count; i++) {

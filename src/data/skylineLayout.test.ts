@@ -4,6 +4,7 @@ import {
   BASIN_RADIUS,
   HERO_LANDMARKS,
   HARBOR_SAILBOATS,
+  classifyMidRiseBlock,
   generateCityGridBlocks,
   generateSeawallLights,
   isInsideBasin,
@@ -48,6 +49,19 @@ test('generated city blocks are deterministic, grounded on land, and avoid hero 
       assert.ok(dist >= 1.5, `${b.id} overlaps hero ${hero.id}`);
     }
   }
+});
+
+test('mid-rise architectural classification produces balanced glass vs masonry slate separation', () => {
+  const blocks = generateCityGridBlocks(2026);
+  const specs = blocks.map((b, i) => classifyMidRiseBlock(i, b));
+  const glassCount = specs.filter((s) => s.facadeMaterial === 'curtain-glass').length;
+  const slateCount = specs.filter((s) => s.facadeMaterial === 'masonry-slate').length;
+  const penthouseCount = specs.filter((s) => s.hasMechanicalPenthouse).length;
+
+  assert.ok(glassCount >= 10, 'expected substantial glass mid-rise blocks');
+  assert.ok(slateCount >= 10, 'expected substantial masonry/slate mid-rise blocks');
+  assert.ok(penthouseCount >= 8, 'expected stepped mechanical penthouses on mid-rise roofs');
+  assert.deepEqual(specs[0], classifyMidRiseBlock(0, blocks[0]));
 });
 
 test('seawall streetlights and harbor sailboats stay strictly inside the circular basin', () => {

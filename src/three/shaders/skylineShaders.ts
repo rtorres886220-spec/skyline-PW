@@ -16,8 +16,11 @@ export interface TowerReflector {
  *   raymarched architectural heightfield cast shadows
  */
 const GLSL3_OPTICS_COMMON = /* glsl */ `
-const float PI = 3.14159265;
-const float INV_TWO_PI = 0.159154943;
+const float PI = 3.14159265359;
+const float INV_TWO_PI = 0.15915494309;
+const vec3 STUDIO_KEY_WARM = vec3(1.032, 1.000, 0.962);
+const vec3 STUDIO_FILL_COOL = vec3(0.935, 0.972, 1.052);
+const vec3 STUDIO_INTERIOR_IVORY = vec3(0.76, 0.70, 0.61);
 
 float fresnelSchlick(float cosTheta, float F0) {
   return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
@@ -70,10 +73,59 @@ vec2 sampleUrbanSpatialAo(sampler2D spatialMap, vec2 worldXZ, float basinRadius)
   return texture(spatialMap, uv).rg;
 }
 
+float unpackDepth16(vec2 rg) {
+  return (rg.r * 255.0 + rg.g) / 255.0;
+}
+
+/**
+ * Real-time Orthographic Depth Shadow Map with 3x3 PCF soft penumbra filtering.
+ * Tall towers cast crisp, grounded soft shadows across lower rooftops, street grids,
+ * neighboring facades, and the harbor waterline.
+ */
+float sampleOrthographicShadowPCF(
+  sampler2D shadowMap,
+  mat4 shadowMatrix,
+  vec2 shadowTexelSize,
+  vec3 worldPos,
+  vec3 surfaceN,
+  vec3 keyDir,
+  float hasShadowMap
+) {
+  if (hasShadowMap < 0.5) {
+    return 1.0;
+  }
+  vec3 dir = normalize(keyDir);
+  float slope = 1.0 - clamp(dot(surfaceN, dir), 0.0, 1.0);
+  vec3 biasedWorld = worldPos + surfaceN * (0.042 + 0.058 * slope);
+  vec4 shadowClip = shadowMatrix * vec4(biasedWorld, 1.0);
+  vec3 shadowCoord = (shadowClip.xyz / max(0.0001, shadowClip.w)) * 0.5 + 0.5;
+
+  if (
+    shadowCoord.x <= 0.002 || shadowCoord.x >= 0.998 ||
+    shadowCoord.y <= 0.002 || shadowCoord.y >= 0.998 ||
+    shadowCoord.z <= 0.001 || shadowCoord.z >= 0.999
+  ) {
+    return 1.0;
+  }
+
+  float depthBias = 0.0026 + 0.0034 * slope;
+  vec2 texel = shadowTexelSize * 1.45;
+  float sum = 0.0;
+
+  for (int ix = -1; ix <= 1; ix++) {
+    for (int iy = -1; iy <= 1; iy++) {
+      vec2 suv = clamp(shadowCoord.xy + vec2(float(ix), float(iy)) * texel, vec2(0.001), vec2(0.999));
+      float occluderDepth = unpackDepth16(textureLod(shadowMap, suv, 0.0).rg);
+      sum += (shadowCoord.z - depthBias > occluderDepth) ? 0.0 : 1.0;
+    }
+  }
+
+  return clamp(mix(0.06, 1.0, sum / 9.0), 0.06, 1.0);
+}
+
 /**
  * Soft raymarched directional cast shadows using the baked 512x512 skyline heightfield
- * stored in spatialMap.b (0..10 world units). Produces soft PCF-like penumbra shadows
- * from tall towers onto neighboring mid-rise roofs, setbacks, streets, and water.
+ * stored in spatialMap.b (0..10 world units). Used alongside real-time 3x3 PCF shadows.
  */
 float sampleDirectionalHeightShadow(
   sampler2D spatialMap,
@@ -87,7 +139,6 @@ float sampleDirectionalHeightShadow(
   float slopeY = max(dir.y, 0.24);
   vec2 stepHoriz = dir.xz / slopeY;
 
-  // Offset origin slightly outside vertical walls along outward normal to eliminate self-shadow acne
   float isVertical = 1.0 - smoothstep(0.60, 0.85, abs(surfaceN.y));
   vec2 horizN = length(surfaceN.xz) > 0.001 ? normalize(surfaceN.xz) : vec2(0.0);
   vec2 originXZ = worldPos.xz + horizN * (0.18 * isVertical);
@@ -116,7 +167,6 @@ float sampleDirectionalHeightShadow(
 /**
  * Computes subtle 1-2px machined chamfer bevel normal perturbation along UV face edges
  * using screen-space derivatives (fwidth) and a screen-space tangent frame.
- * Returns vec4(perturbedNormal.xyz, chamferEdgeMask).
  */
 vec4 computeMachinedChamfer(
   vec3 N,
@@ -159,15 +209,14 @@ vec4 computeMachinedChamfer(
 }
 
 /**
- * Whisper-subtle dark atmospheric depth/height haze trapped strictly inside the lowest
- * urban street corridors between tall towers to separate foreground from background silhouettes.
+ * Whisper-subtle cool obsidian-slate atmospheric haze inside lowest street corridors.
  */
 vec3 applyCanyonAtmosphere(vec3 color, vec3 worldPos, vec3 camPos, float canyonAo) {
   float lowCorridor = smoothstep(2.35, 0.10, worldPos.y);
   float deepCanyon = smoothstep(0.84, 0.30, canyonAo);
   float depthFactor = smoothstep(28.0, 52.0, length(camPos - worldPos));
   float mistAmount = lowCorridor * deepCanyon * depthFactor * 0.28;
-  vec3 canyonMistColor = vec3(0.0085, 0.0092, 0.0114);
+  vec3 canyonMistColor = vec3(0.0082, 0.0091, 0.0116);
   return mix(color, canyonMistColor, clamp(mistAmount, 0.0, 0.28));
 }
 
@@ -183,6 +232,37 @@ vec3 applySpecularParallax(vec3 V, vec2 tiltVec, vec2 velVec, float strength) {
   return normalize(V + viewRight * offset.x + viewUp * offset.y);
 }
 `;
+
+export function createShadowDepthMaterial(): THREE.ShaderMaterial {
+  return new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    side: THREE.FrontSide,
+    vertexShader: /* glsl */ `
+      out float vOrthoDepth;
+
+      void main() {
+        vec4 localPosition = vec4(position, 1.0);
+        #ifdef USE_INSTANCING
+          localPosition = instanceMatrix * localPosition;
+        #endif
+        vec4 clipPos = projectionMatrix * viewMatrix * modelMatrix * localPosition;
+        vOrthoDepth = clipPos.z * 0.5 + 0.5;
+        gl_Position = clipPos;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      in float vOrthoDepth;
+      out vec4 fragColor;
+
+      void main() {
+        float c = clamp(vOrthoDepth, 0.0, 1.0) * 255.0;
+        float hi = floor(c);
+        float lo = fract(c);
+        fragColor = vec4(hi / 255.0, lo, 0.0, 1.0);
+      }
+    `,
+  });
+}
 
 export function createHarborWaterMaterial(
   waterMicroRippleMap: THREE.Texture,
@@ -211,6 +291,10 @@ export function createHarborWaterMaterial(
       uGroundAoMap: { value: groundAoMap },
       uReflectMap: { value: planarReflectionMap },
       uReflectMatrix: { value: new THREE.Matrix4() },
+      uShadowMap: { value: null },
+      uShadowMatrix: { value: new THREE.Matrix4() },
+      uShadowTexelSize: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+      uHasShadowMap: { value: 0.0 },
       uSoftboxKeyDir: { value: new THREE.Vector3(-0.44, 0.68, 0.58) },
       uKeyIntensity: { value: 1.26 },
       uRimIntensity: { value: 0.92 },
@@ -245,6 +329,10 @@ export function createHarborWaterMaterial(
       uniform sampler2D uStudioIblMap;
       uniform sampler2D uGroundAoMap;
       uniform sampler2D uReflectMap;
+      uniform sampler2D uShadowMap;
+      uniform mat4 uShadowMatrix;
+      uniform vec2 uShadowTexelSize;
+      uniform float uHasShadowMap;
       uniform vec3 uSoftboxKeyDir;
       uniform float uKeyIntensity;
       uniform float uRimIntensity;
@@ -342,12 +430,21 @@ export function createHarborWaterMaterial(
         // Schlick Fresnel for polished dark smoked resin/water (F0 = 0.032)
         float fresnel = fresnelSchlick(NdotV, 0.032);
 
-        float waterShadow = sampleDirectionalHeightShadow(
-          uGroundAoMap,
-          vWorldPos,
-          vec3(0.0, 1.0, 0.0),
-          keyL,
-          uBasinRadius
+        float waterShadow = min(
+          sampleOrthographicShadowPCF(
+            uShadowMap,
+            uShadowMatrix,
+            uShadowTexelSize,
+            vWorldPos,
+            vec3(0.0, 1.0, 0.0),
+            keyL,
+            uHasShadowMap
+          ),
+          mix(
+            0.55,
+            1.0,
+            sampleDirectionalHeightShadow(uGroundAoMap, vWorldPos, vec3(0.0, 1.0, 0.0), keyL, uBasinRadius)
+          )
         );
 
         // Real-time Planar Reflection Pass (inverted skyscrapers, Convention Center & lamps)
@@ -442,6 +539,10 @@ export function createLandmassObsidianMaterial(
       uGroundAoMap: { value: groundAoMap },
       uMicroMap: { value: microImperfectionMap },
       uStudioIblMap: { value: studioIblMap },
+      uShadowMap: { value: null },
+      uShadowMatrix: { value: new THREE.Matrix4() },
+      uShadowTexelSize: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+      uHasShadowMap: { value: 0.0 },
       uBasinRadius: { value: basinRadius },
       uSoftboxKeyDir: { value: new THREE.Vector3(-0.44, 0.68, 0.58) },
       uKeyIntensity: { value: 1.26 },
@@ -467,6 +568,10 @@ export function createLandmassObsidianMaterial(
       uniform sampler2D uGroundAoMap;
       uniform sampler2D uMicroMap;
       uniform sampler2D uStudioIblMap;
+      uniform sampler2D uShadowMap;
+      uniform mat4 uShadowMatrix;
+      uniform vec2 uShadowTexelSize;
+      uniform float uHasShadowMap;
       uniform float uBasinRadius;
       uniform vec3 uSoftboxKeyDir;
       uniform float uKeyIntensity;
@@ -507,14 +612,24 @@ export function createLandmassObsidianMaterial(
         float canyonAo = mix(0.24 - uPressDepth * 0.08, 1.0, aoSample.g);
         float combinedAo = tightCreviceAo * canyonAo;
 
-        // Real soft raymarched cast shadows from skyscrapers onto streets, plazas & esplanade
-        float castShadow = sampleDirectionalHeightShadow(
+        // Real-time 3x3 PCF Orthographic Shadow Map + fallback heightfield shadow across streets & plazas
+        float pcfShadow = sampleOrthographicShadowPCF(
+          uShadowMap,
+          uShadowMatrix,
+          uShadowTexelSize,
+          vWorldPos,
+          baseN,
+          keyL,
+          uHasShadowMap
+        );
+        float heightShadow = sampleDirectionalHeightShadow(
           uGroundAoMap,
           vWorldPos,
           baseN,
           keyL,
           uBasinRadius
         );
+        float castShadow = uHasShadowMap > 0.5 ? pcfShadow : heightShadow;
 
         // Rotated San Diego downtown street grid
         float c = cos(0.22);
@@ -528,9 +643,9 @@ export function createLandmassObsidianMaterial(
           sdfLine(streetUv.y, 0.606, 0.024)
         ) * smoothstep(0.5, 0.95, baseN.y);
 
-        // Strong 3:1 key-to-fill dead-matte diffuse (zero glossy glare, roughness ~0.88)
-        float keyLambert = max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity;
-        float fillLambert = wrapDiffuse(N, fillL, 0.35) * uFillIntensity * 0.36;
+        // 3:1 key-to-fill dead-matte diffuse with subtle warm key / cool obsidian fill temperature
+        vec3 keyTerm = STUDIO_KEY_WARM * max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity * 0.96;
+        vec3 fillTerm = STUDIO_FILL_COOL * (0.16 * uFillIntensity + wrapDiffuse(N, fillL, 0.35) * uFillIntensity * 0.38);
         vec3 studioBounce = sampleStudioIBL(
           uStudioIblMap,
           N,
@@ -541,20 +656,20 @@ export function createLandmassObsidianMaterial(
           uFillIntensity
         );
 
-        float litBalance = 0.16 * uFillIntensity + keyLambert * 0.88 + fillLambert + studioBounce.g * 0.08;
+        vec3 litBalance = keyTerm + fillTerm + studioBounce * 0.075;
         vec3 slateBase =
-          vec3(0.0085, 0.0088, 0.0098) *
+          vec3(0.0086, 0.0089, 0.0101) *
           (0.90 + 0.20 * grain) *
           litBalance *
           combinedAo;
 
-        // Seawall beveled concrete curb catches directional key light (no glowing white line)
+        // Seawall beveled concrete curb catches neutral-warm key light
         float edgeWall = 1.0 - smoothstep(0.22, 0.80, abs(baseN.y));
         float curbKey = max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity;
         vec3 seawallConcrete =
           vec3(0.015, 0.016, 0.018) *
           edgeWall *
-          (0.24 * uFillIntensity + curbKey * 1.15) *
+          (STUDIO_FILL_COOL * 0.24 * uFillIntensity + STUDIO_KEY_WARM * curbKey * 1.15) *
           mix(0.45, 1.0, aoSample.g);
 
         // Subtle promenade streetlight bounce onto wet/matte Embarcadero concrete
@@ -564,13 +679,13 @@ export function createLandmassObsidianMaterial(
         vec3 streetHighlight =
           vec3(0.016, 0.017, 0.020) *
           streetGrid *
-          (0.28 + 0.72 * castShadow) *
+          mix(STUDIO_FILL_COOL * 0.25, STUDIO_KEY_WARM, castShadow) *
           combinedAo;
 
         vec3 finalRgb = slateBase
           + streetHighlight
           + seawallConcrete
-          + vec3(0.014, 0.015, 0.018) * promenadeSpill * mix(0.4, 1.0, aoSample.g);
+          + vec3(0.016, 0.0155, 0.015) * promenadeSpill * mix(0.4, 1.0, aoSample.g);
         finalRgb = applyCanyonAtmosphere(finalRgb, vWorldPos, cameraPosition, aoSample.g);
         fragColor = vec4(finalRgb, 1.0);
       }
@@ -578,9 +693,15 @@ export function createLandmassObsidianMaterial(
   });
 }
 
+export interface MatteSlateOptions {
+  baseColor?: number;
+  masonryWindows?: boolean;
+}
+
 /**
- * Dead-Matte Anodized Dark Slate / Concrete Material (roughness ~0.88, zero glossy glare).
- * Used for building podiums, stepped setback terraces, mechanical decks, and Convention colonnade.
+ * Dead-Matte Anodized Dark Slate / Architectural Limestone Material (roughness ~0.88).
+ * Used for building podiums, parapets, mechanical penthouses, and (with masonryWindows: true)
+ * punched architectural masonry/limestone mid-rise blocks that contrast against glossy glass towers.
  */
 export function createMatteSlateMaterial(
   grainTexture: THREE.Texture,
@@ -588,8 +709,13 @@ export function createMatteSlateMaterial(
   microImperfectionMap: THREE.Texture,
   studioIblMap: THREE.Texture,
   basinRadius: number,
-  baseColor = 0x1e2025,
+  optionsOrColor: number | MatteSlateOptions = 0x1e2025,
 ): THREE.ShaderMaterial {
+  const opts: MatteSlateOptions =
+    typeof optionsOrColor === 'number' ? { baseColor: optionsOrColor } : optionsOrColor;
+  const baseColor = opts.baseColor ?? 0x1e2025;
+  const masonryWindows = opts.masonryWindows ?? false;
+
   return new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     uniforms: {
@@ -597,7 +723,12 @@ export function createMatteSlateMaterial(
       uGroundAoMap: { value: groundAoMap },
       uMicroMap: { value: microImperfectionMap },
       uStudioIblMap: { value: studioIblMap },
+      uShadowMap: { value: null },
+      uShadowMatrix: { value: new THREE.Matrix4() },
+      uShadowTexelSize: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+      uHasShadowMap: { value: 0.0 },
       uBaseColor: { value: new THREE.Color(baseColor) },
+      uMasonryWindows: { value: masonryWindows ? 1.0 : 0.0 },
       uBasinRadius: { value: basinRadius },
       uSoftboxKeyDir: { value: new THREE.Vector3(-0.44, 0.68, 0.58) },
       uKeyIntensity: { value: 1.26 },
@@ -632,7 +763,12 @@ export function createMatteSlateMaterial(
       uniform sampler2D uGroundAoMap;
       uniform sampler2D uMicroMap;
       uniform sampler2D uStudioIblMap;
+      uniform sampler2D uShadowMap;
+      uniform mat4 uShadowMatrix;
+      uniform vec2 uShadowTexelSize;
+      uniform float uHasShadowMap;
       uniform vec3 uBaseColor;
+      uniform float uMasonryWindows;
       uniform float uBasinRadius;
       uniform vec3 uSoftboxKeyDir;
       uniform float uKeyIntensity;
@@ -666,20 +802,51 @@ export function createMatteSlateMaterial(
         vec4 chamferRes = computeMachinedChamfer(baseN, vWorldPos, vUv, 0.42, 1.0);
         vec3 N = normalize(chamferRes.xyz + vec3((micro.g - 0.5) * 0.025));
 
-        float castShadow = sampleDirectionalHeightShadow(
+        float pcfShadow = sampleOrthographicShadowPCF(
+          uShadowMap,
+          uShadowMatrix,
+          uShadowTexelSize,
+          vWorldPos,
+          baseN,
+          keyL,
+          uHasShadowMap
+        );
+        float heightShadow = sampleDirectionalHeightShadow(
           uGroundAoMap,
           vWorldPos,
           baseN,
           keyL,
           uBasinRadius
         );
+        float castShadow = uHasShadowMap > 0.5 ? pcfShadow : heightShadow;
+
         vec2 spatialAo = sampleUrbanSpatialAo(uGroundAoMap, vWorldPos.xz, uBasinRadius);
         float baseAo = mix(0.42 - uPressDepth * 0.14, 1.0, smoothstep(0.08, 0.48, vWorldPos.y));
         float canyonAo = mix(0.36, 1.0, spatialAo.g);
 
-        // 3:1 directional key vs cool dark fill (dead-matte roughness ~0.88, zero glossy glare)
-        float keyDiffuse = max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity;
-        float fillDiffuse = wrapDiffuse(N, fillL, 0.35) * uFillIntensity * 0.35;
+        // Optional punched architectural limestone/slate masonry bays on mid-rise blocks
+        float isRoof = smoothstep(0.65, 0.90, abs(baseN.y));
+        float masonryRecess = 0.0;
+        float courseLine = 0.0;
+        if (uMasonryWindows > 0.5 && isRoof < 0.5) {
+          vec2 horizNormal = length(baseN.xz) > 0.01 ? normalize(baseN.xz) : vec2(0.0, 1.0);
+          vec3 wallT = vec3(horizNormal.y, 0.0, -horizNormal.x);
+          float wallX = dot(vWorldPos.xz, wallT.xz);
+          float bayU = fract(wallX * 3.1);
+          float bayV = fract(vWorldPos.y * 3.2);
+          float winX = smoothstep(0.16, 0.24, bayU) * (1.0 - smoothstep(0.76, 0.84, bayU));
+          float winY = smoothstep(0.24, 0.32, bayV) * (1.0 - smoothstep(0.80, 0.88, bayV));
+          masonryRecess = winX * winY;
+          float lintelAO = smoothstep(0.72, 0.88, bayV) * winX;
+          masonryRecess = max(masonryRecess * 0.85, lintelAO);
+          // Subtle horizontal ashlar stone course seam
+          float cDist = abs(bayV - 0.04);
+          courseLine = 1.0 - smoothstep(0.0, 0.045, cDist);
+        }
+
+        // 3:1 directional key vs cool obsidian fill (dead-matte roughness ~0.88)
+        vec3 keyTerm = STUDIO_KEY_WARM * max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity * 0.96;
+        vec3 fillTerm = STUDIO_FILL_COOL * (0.15 * uFillIntensity + wrapDiffuse(N, fillL, 0.35) * uFillIntensity * 0.36);
         vec3 studioDiff = sampleStudioIBL(
           uStudioIblMap,
           N,
@@ -690,13 +857,18 @@ export function createMatteSlateMaterial(
           uFillIntensity
         );
 
-        float lit = 0.15 * uFillIntensity + keyDiffuse * 0.95 + fillDiffuse + studioDiff.g * 0.09;
-        vec3 color = uBaseColor * (0.88 + 0.22 * grain) * lit * baseAo * canyonAo;
+        vec3 lit = keyTerm + fillTerm + studioDiff * 0.08;
+        vec3 albedo = uBaseColor * (0.86 + 0.26 * grain);
+        if (uMasonryWindows > 0.5) {
+          albedo = mix(albedo, albedo * 0.26, masonryRecess);
+          albedo *= 1.0 - courseLine * 0.24;
+        }
+        vec3 color = albedo * lit * baseAo * canyonAo;
 
-        // Subtle directional matte bevel highlight strictly on faces facing key light (zero shadow-side outline)
+        // Subtle warm-neutral matte bevel catchlight strictly on faces facing key light
         float faceKeyVis = smoothstep(-0.08, 0.25, dot(baseN, keyL));
         float bevelKey = pow(max(dot(chamferRes.xyz, keyL), 0.0), 1.8) * castShadow * faceKeyVis * chamferRes.w;
-        color += vec3(0.016, 0.017, 0.020) * bevelKey * uKeyIntensity;
+        color += STUDIO_KEY_WARM * vec3(0.016, 0.017, 0.019) * bevelKey * uKeyIntensity;
         color = applyCanyonAtmosphere(color, vWorldPos, cameraPosition, spatialAo.g);
 
         fragColor = vec4(color, 1.0);
@@ -747,6 +919,10 @@ export function createSdfGlassMaterial(
       uStudioIblMap: { value: studioIblMap },
       uMicroMap: { value: microImperfectionMap },
       uGroundAoMap: { value: groundAoMap },
+      uShadowMap: { value: null },
+      uShadowMatrix: { value: new THREE.Matrix4() },
+      uShadowTexelSize: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+      uHasShadowMap: { value: 0.0 },
       uBasinRadius: { value: basinRadius },
       uBaseColor: { value: new THREE.Color(baseTint) },
       uSoftboxKeyDir: { value: new THREE.Vector3(-0.44, 0.68, 0.58) },
@@ -793,6 +969,10 @@ export function createSdfGlassMaterial(
       uniform sampler2D uStudioIblMap;
       uniform sampler2D uMicroMap;
       uniform sampler2D uGroundAoMap;
+      uniform sampler2D uShadowMap;
+      uniform mat4 uShadowMatrix;
+      uniform vec2 uShadowTexelSize;
+      uniform float uHasShadowMap;
       uniform float uBasinRadius;
       uniform vec3 uBaseColor;
       uniform vec3 uSoftboxKeyDir;
@@ -861,21 +1041,32 @@ export function createSdfGlassMaterial(
         // Distinguish dead-matte rooftop planes vs vertical glass curtain walls
         float isRoof = smoothstep(0.65, 0.90, abs(baseN.y));
 
-        // Real cast height shadows & urban canyon AO
-        float castShadow = sampleDirectionalHeightShadow(
+        // Real-time 3x3 PCF Orthographic Shadow Map + Urban Canyon AO
+        float pcfShadow = sampleOrthographicShadowPCF(
+          uShadowMap,
+          uShadowMatrix,
+          uShadowTexelSize,
+          vWorldPos,
+          baseN,
+          keyL,
+          uHasShadowMap
+        );
+        float heightShadow = sampleDirectionalHeightShadow(
           uGroundAoMap,
           vWorldPos,
           baseN,
           keyL,
           uBasinRadius
         );
+        float castShadow = uHasShadowMap > 0.5 ? pcfShadow : heightShadow;
+
         vec2 spatialAo = sampleUrbanSpatialAo(uGroundAoMap, vWorldPos.xz, uBasinRadius);
         float groundCreviceAo = mix(0.30 - uPressDepth * 0.14, 1.0, pow(smoothstep(0.08, 0.58, vWorldPos.y), 1.0 + uPressDepth * 0.55));
         float tierCreviceAo = mix(0.60 - uPressDepth * 0.10, 1.0, pow(smoothstep(0.0, 0.14, vUv.y), 1.0 + uPressDepth * 0.45));
         float canyonAo = mix(0.45, 1.0, mix(spatialAo.g, 1.0, clamp(vWorldPos.y / 3.8, 0.0, 1.0)));
         float contactAo = groundCreviceAo * tierCreviceAo * canyonAo;
 
-        // Exact wall-aligned horizontal tangent so panes never stretch or skew on angled facades
+        // Exact wall-aligned horizontal tangent so panes & interior parallax never skew on angled facades
         vec2 horizNormal = length(baseN.xz) > 0.01 ? normalize(baseN.xz) : vec2(0.0, 1.0);
         vec3 wallT = vec3(horizNormal.y, 0.0, -horizNormal.x);
         float wallX = dot(vWorldPos.xz, wallT.xz);
@@ -883,28 +1074,28 @@ export function createSdfGlassMaterial(
         float mullionFreq = uMullionDensity * 0.44;
         float floorFreq = uFloorDensity * 0.42;
 
-        // Crisp horizontal spandrel bands (~26% of floor height) & vertical mullions
+        // Crisp horizontal spandrel bands (~23% of floor height) & vertical mullions
         float floorScaled = vWorldPos.y * floorFreq;
         float floorPhase = fract(floorScaled);
         float fwFloor = max(fwidth(floorScaled), 0.002);
-        float spandrelMask = (1.0 - smoothstep(0.24 - fwFloor, 0.24 + fwFloor, floorPhase)) * (1.0 - isRoof);
+        float spandrelMask = (1.0 - smoothstep(0.22 - fwFloor, 0.22 + fwFloor, floorPhase)) * (1.0 - isRoof);
         float vMullion = sdfGridLine(wallX, mullionFreq, 0.024) * (1.0 - isRoof);
         float frameMask = clamp(max(spandrelMask, vMullion), 0.0, 1.0);
 
-        // Deterministic per-pane normal micro-jitter (±0.04) inside glass vision bays
+        // Subtle per-pane normal micro-tilt (±0.020) inside glass vision bays
         vec2 paneCell = floor(vec2(wallX * mullionFreq + 0.5, floorScaled));
-        float jx = (hash21(paneCell) - 0.5) * 0.08;
-        float jy = (hash21(paneCell + vec2(31.7, 17.3)) - 0.5) * 0.08;
+        float jx = (hash21(paneCell) - 0.5) * 0.040;
+        float jy = (hash21(paneCell + vec2(31.7, 17.3)) - 0.5) * 0.040;
         vec3 paneN = normalize(N + (wallT * jx + vec3(0.0, 1.0, 0.0) * jy) * (1.0 - frameMask) * (1.0 - isRoof));
 
         float NdotV = clamp(dot(paneN, V), 0.0, 1.0);
-        float fresnel = fresnelSchlick(NdotV, 0.062);
+        float fresnel = fresnelSchlick(NdotV, 0.072);
 
-        // Glass roughness ~0.075 with subtle 2% variation vs matte dark anodized spandrels (~0.66)
+        // Glass roughness ~0.062 with subtle micro-variance vs matte dark anodized spandrels (~0.64)
         float glassRoughness = clamp(
-          mix(0.074 + (micro.r - 0.5) * 0.022, 0.66, frameMask),
-          0.045,
-          0.70
+          mix(0.062 + (micro.r - 0.5) * 0.020, 0.64, frameMask),
+          0.04,
+          0.68
         );
 
         vec3 R_g = reflect(-V, paneN);
@@ -918,59 +1109,99 @@ export function createSdfGlassMaterial(
         float iblB = sampleStudioIBL(uStudioIblMap, dirB, glassRoughness, keyL, uKeyIntensity, uRimIntensity, uFillIntensity).b;
         vec3 studioIbl = vec3(iblR, iblG, iblB);
 
-        // 3:1 key-to-fill lighting across vertical tower faces + real cast shadow darkening
+        // 3:1 key-to-fill lighting across vertical tower faces (warm key vs cool obsidian fill)
         float keyFace = max(dot(paneN, keyL), 0.0) * castShadow;
         float fillFace = wrapDiffuse(paneN, fillL, 0.22) * uFillIntensity * 0.24;
-        float keyDiffuseFactor = 0.12 * uFillIntensity + keyFace * uKeyIntensity * 0.96 + fillFace;
+        vec3 keyDiffuseRgb = STUDIO_FILL_COOL * (0.12 * uFillIntensity + fillFace)
+          + STUDIO_KEY_WARM * (keyFace * uKeyIntensity * 0.96);
 
-        // Beer-Lambert smoked glass depth absorption
-        float opticalThickness = 0.55 / max(0.26, NdotV);
-        vec3 beerLambert = exp(-vec3(0.54, 0.49, 0.43) * opticalThickness);
+        // Beer-Lambert smoked glass depth absorption (subtle cool obsidian glass body)
+        float opticalThickness = 0.52 / max(0.26, NdotV);
+        vec3 beerLambert = exp(-vec3(0.54, 0.49, 0.42) * opticalThickness);
 
-        // Sparse, clean softly glowing horizontal interior floor bands (zero static noise!)
+        // Inner Depth Layer: GLSL Tangent-Space Interior Parallax (recessed 3D floor slabs + office bays)
+        float bayU = fract(wallX * mullionFreq * 0.5 + 0.25);
+        float bayV = clamp((floorPhase - 0.22) / 0.78, 0.001, 0.999);
+        float vDotN = max(0.22, abs(dot(V_raw, baseN)));
+        vec2 rayT = vec2(-dot(V_raw, wallT), -V_raw.y) / vDotN;
+
+        float tSlab = (rayT.y > 0.0001)
+          ? (1.0 - bayV) / rayT.y
+          : ((rayT.y < -0.0001) ? bayV / (-rayT.y) : 99.0);
+        float tCol = (rayT.x > 0.0001)
+          ? (1.0 - bayU) / rayT.x
+          : ((rayT.x < -0.0001) ? bayU / (-rayT.x) : 99.0);
+        float tBack = 0.46;
+        float tHit = min(tBack, min(tSlab, tCol));
+        vec2 hitUv = clamp(vec2(bayU, bayV) + rayT * tHit, vec2(0.0), vec2(1.0));
+        float hitSlab = step(tSlab, min(tCol, tBack));
+        float hitCol = step(tCol, min(tSlab, tBack)) * (1.0 - hitSlab);
+
+        float interiorBoxAo = (0.45 + 0.55 * smoothstep(0.0, 0.22, hitUv.y) * smoothstep(1.0, 0.76, hitUv.y))
+          * (0.55 + 0.45 * smoothstep(0.0, 0.16, hitUv.x) * smoothstep(1.0, 0.84, hitUv.x));
+
+        // Sparse, subtle softly illuminated warm-ivory office bays recessed behind glass
         float floorRand = hash21(vec2(paneCell.y, 13.7));
-        float wingBucket = floor(wallX * mullionFreq * 0.22);
+        float wingBucket = floor(wallX * mullionFreq * 0.24);
         float wingRand = hash21(vec2(wingBucket, paneCell.y + 7.1));
-        float occupiedBand = step(0.84, floorRand) * smoothstep(0.35, 0.65, wingRand);
-        float visionVert = smoothstep(0.24, 0.34, floorPhase) * (1.0 - smoothstep(0.82, 0.98, floorPhase));
-        float interiorLuminance = occupiedBand * visionVert * (1.0 - frameMask) * (0.072 + 0.052 * uIsHero);
-        vec3 interiorGlow = vec3(0.64, 0.66, 0.72) * interiorLuminance * (1.0 + uPressDepth * 0.35) * beerLambert;
+        float occupiedBand = step(0.83, floorRand) * smoothstep(0.32, 0.68, wingRand);
+        float backWallMask = (1.0 - hitSlab) * (1.0 - hitCol * 0.65);
+        float interiorDepthShade = mix(0.35, 1.0, backWallMask) * interiorBoxAo;
 
-        // Smoked glass body vs matte dark anodized spandrel/mullion strips
-        vec3 glassBody = uBaseColor * beerLambert * (0.55 + 0.88 * keyDiffuseFactor);
-        vec3 spandrelBody = vec3(0.011, 0.012, 0.014) * (0.30 + 1.18 * keyDiffuseFactor);
+        float bayGlowProfile = smoothstep(0.08, 0.35, hitUv.y) * (1.0 - smoothstep(0.75, 0.98, hitUv.y));
+        float interiorLum = occupiedBand * bayGlowProfile * (1.0 - frameMask) * (1.0 - isRoof) * (0.068 + 0.056 * uIsHero);
+        vec3 slabInteriorBase = vec3(0.006, 0.0065, 0.0075) * interiorDepthShade * (0.40 + 0.60 * keyFace);
+        vec3 interiorGlow = STUDIO_INTERIOR_IVORY * interiorLum * backWallMask * interiorBoxAo * (1.0 + uPressDepth * 0.35);
+        vec3 innerParallaxLayer = (slabInteriorBase + interiorGlow) * beerLambert;
+
+        // Smoked outer glass body vs matte dark anodized spandrel/mullion strips
+        vec3 glassBody = uBaseColor * beerLambert * (vec3(0.45) + 0.90 * keyDiffuseRgb) + innerParallaxLayer;
+        vec3 spandrelBody = vec3(0.011, 0.012, 0.014) * (vec3(0.28) + 1.18 * keyDiffuseRgb);
         vec3 facadeBase = mix(glassBody, spandrelBody, frameMask);
 
-        // Per-pane studio IBL specular reflection: crisp pane-to-pane variation on sunlit side, dark glass on shadow side
-        float reflVisibility = mix(0.22, 1.0, keyFace * 0.85 + 0.15) * mix(0.35, 1.0, castShadow);
-        vec3 glassReflection = studioIbl * (0.08 + 0.92 * fresnel) * 0.068 * (1.0 - frameMask * 0.82) * reflVisibility;
+        // Outer Glass Layer: Smooth glossy Fresnel + vertical studio strip-softbox gradient sweep (brighter upper faces fading darker toward street)
+        float heightSheen = smoothstep(0.45, 7.8, vWorldPos.y);
+        float faceSoftboxAlign = smoothstep(-0.18, 0.72, dot(paneN.xz, normalize(keyL.xz)));
+        float stripSoftbox = pow(clamp(dot(R_g, normalize(vec3(keyL.x * 0.62, 0.72, keyL.z * 0.62))), 0.0, 1.0), 3.4);
+        vec3 upperStripSweep = STUDIO_KEY_WARM
+          * (0.035 + 0.140 * heightSheen)
+          * (0.30 + 0.70 * faceSoftboxAlign)
+          * (0.35 + 0.65 * stripSoftbox)
+          * (0.28 + 0.72 * fresnel)
+          * mix(0.22, 1.0, castShadow)
+          * (1.0 - frameMask * 0.85)
+          * uKeyIntensity;
 
-        // Subtle directional chamfer catchlight ONLY on sunlit-facing corners (zero wireframe outline on shadow edges!)
+        float reflVisibility = mix(0.20, 1.0, keyFace * 0.85 + 0.15) * mix(0.32, 1.0, castShadow);
+        vec3 glassReflection = studioIbl * (0.08 + 0.92 * fresnel) * 0.072 * (1.0 - frameMask * 0.82) * reflVisibility
+          + upperStripSweep;
+
+        // Subtle warm-neutral directional chamfer catchlight ONLY on sunlit-facing corners
         float faceKeyVis = smoothstep(-0.08, 0.25, dot(baseN, keyL));
         float chamferKeyFacing = pow(max(dot(N, keyL), 0.0), 2.0) * castShadow * uKeyIntensity * faceKeyVis;
         float chamferRimFacing = pow(max(dot(N, rimL), 0.0), 2.4) * uRimIntensity * 0.28 * smoothstep(-0.1, 0.25, dot(baseN, rimL));
-        float directionalEdge = (chamferKeyFacing + chamferRimFacing) * chamferMask;
-        vec3 chamferCatch = vec3(0.24, 0.26, 0.30) * directionalEdge * uEdgeLuminance * (0.25 + 0.35 * uIsHero + uPressDepth * 0.12);
+        vec3 chamferCatch = (STUDIO_KEY_WARM * chamferKeyFacing + vec3(0.98, 0.99, 1.02) * chamferRimFacing)
+          * chamferMask * vec3(0.24, 0.25, 0.28) * uEdgeLuminance * (0.25 + 0.35 * uIsHero + uPressDepth * 0.12);
 
-        vec3 glassLit = (facadeBase + interiorGlow) * contactAo
+        vec3 glassLit = facadeBase * contactAo
           + glassReflection * mix(0.55, 1.0, contactAo)
           + chamferCatch
-          + vec3(0.18, 0.20, 0.24) * uHighlightBoost * 0.35;
+          + vec3(0.18, 0.19, 0.22) * uHighlightBoost * 0.35;
 
-        // Dead-matte architectural slate/concrete rooftop (roughness ~0.88, zero glossy glare, no bright perimeter border)
+        // Dead-matte architectural slate/concrete rooftop (roughness ~0.88, receiving real-time PCF shadows)
         float roofGrid = max(
           sdfGridLine(vWorldPos.x, 1.8, 0.020),
           sdfGridLine(vWorldPos.z, 1.8, 0.020)
         );
         float roofKey = max(dot(baseN, keyL), 0.0) * castShadow * uKeyIntensity;
         float roofFill = wrapDiffuse(baseN, fillL, 0.35) * uFillIntensity * 0.30;
-        float roofLit = 0.14 * uFillIntensity + roofKey * 0.96 + roofFill;
+        vec3 roofLit = STUDIO_FILL_COOL * (0.14 * uFillIntensity + roofFill) + STUDIO_KEY_WARM * (roofKey * 0.98);
         float roofBevel = pow(max(dot(N, keyL), 0.0), 2.0) * castShadow * chamferMask * smoothstep(0.0, 0.4, dot(N - baseN, keyL));
 
         vec3 roofColor =
-          vec3(0.0085, 0.0089, 0.0099) * (0.88 + 0.22 * grain) * roofLit * canyonAo
-          + vec3(0.010) * roofGrid * (0.30 + 0.70 * castShadow) * canyonAo
-          + vec3(0.014, 0.015, 0.017) * roofBevel * uKeyIntensity;
+          vec3(0.0085, 0.0089, 0.0101) * (0.88 + 0.22 * grain) * roofLit * canyonAo
+          + vec3(0.010) * roofGrid * mix(STUDIO_FILL_COOL * 0.28, STUDIO_KEY_WARM, castShadow) * canyonAo
+          + STUDIO_KEY_WARM * vec3(0.015, 0.015, 0.016) * roofBevel * uKeyIntensity;
 
         vec3 finalRgb = mix(glassLit, roofColor, isRoof);
         finalRgb = applyCanyonAtmosphere(finalRgb, vWorldPos, cameraPosition, spatialAo.g);
@@ -1020,6 +1251,10 @@ export function createAnisotropicMetalMaterial(
       uStudioIblMap: { value: studioIblMap },
       uMicroMap: { value: microImperfectionMap },
       uGroundAoMap: { value: groundAoMap },
+      uShadowMap: { value: null },
+      uShadowMatrix: { value: new THREE.Matrix4() },
+      uShadowTexelSize: { value: new THREE.Vector2(1 / 1024, 1 / 1024) },
+      uHasShadowMap: { value: 0.0 },
       uBasinRadius: { value: basinRadius },
       uBaseColor: { value: new THREE.Color(baseColor) },
       uSoftboxKeyDir: { value: new THREE.Vector3(-0.44, 0.68, 0.58) },
@@ -1060,6 +1295,10 @@ export function createAnisotropicMetalMaterial(
       uniform sampler2D uStudioIblMap;
       uniform sampler2D uMicroMap;
       uniform sampler2D uGroundAoMap;
+      uniform sampler2D uShadowMap;
+      uniform mat4 uShadowMatrix;
+      uniform vec2 uShadowTexelSize;
+      uniform float uHasShadowMap;
       uniform float uBasinRadius;
       uniform vec3 uBaseColor;
       uniform vec3 uSoftboxKeyDir;
@@ -1150,7 +1389,9 @@ export function createAnisotropicMetalMaterial(
 
         float castShadow = uRadialAnisotropy > 0.5
           ? 1.0
-          : sampleDirectionalHeightShadow(uGroundAoMap, vWorldPos, baseN, keyL, uBasinRadius);
+          : (uHasShadowMap > 0.5
+              ? sampleOrthographicShadowPCF(uShadowMap, uShadowMatrix, uShadowTexelSize, vWorldPos, baseN, keyL, uHasShadowMap)
+              : sampleDirectionalHeightShadow(uGroundAoMap, vWorldPos, baseN, keyL, uBasinRadius));
 
         float anisoSpec =
           wardAnisotropic(N, V, keyL, T, B, ax, ay) * uKeyIntensity * castShadow * 0.72 +
@@ -1175,23 +1416,24 @@ export function createAnisotropicMetalMaterial(
         float specScale = uRadialAnisotropy > 0.5 ? 0.065 : 0.42;
 
         float fresnel = fresnelSchlick(NdotV, 0.58);
-        // Strong 3:1 key-to-fill directional shading
+        // Strong 3:1 key-to-fill directional shading with subtle warm key / cool shadow tint
         float keyDiff = max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity;
         float rimDiff = max(dot(N, rimL), 0.0) * uRimIntensity * 0.25;
         float fillDiff = wrapDiffuse(N, fillL, 0.25) * uFillIntensity * 0.28;
-        float diffuse = 0.14 * uFillIntensity + keyDiff * 0.72 + rimDiff + fillDiff;
+        vec3 diffuseRgb = STUDIO_FILL_COOL * (0.14 * uFillIntensity + fillDiff)
+          + STUDIO_KEY_WARM * (keyDiff * 0.74)
+          + vec3(0.98, 0.99, 1.02) * rimDiff;
 
         // Directional chamfer catchlight strictly facing key/rim softboxes
         float faceKeyVis = smoothstep(-0.08, 0.25, dot(baseN, keyL));
-        float chamferKeyFacing = pow(max(dot(N, keyL), 0.0), 1.8) * castShadow * uKeyIntensity * faceKeyVis;
+        float chamferKeyFacing = pow(max(dot(N, keyL), 0.0), 2.0) * castShadow * uKeyIntensity * faceKeyVis;
         float chamferRimFacing = pow(max(dot(N, rimL), 0.0), 2.2) * uRimIntensity * 0.32 * smoothstep(-0.1, 0.25, dot(baseN, rimL));
-        float dirChamfer = (chamferKeyFacing + chamferRimFacing) * chamferMask;
 
         vec3 metalAlbedo = uBaseColor * (0.88 + 0.24 * brush) * (0.94 + 0.12 * grain);
-        vec3 color = metalAlbedo * diffuse * baseAo
-          + vec3(0.84, 0.87, 0.92) * (anisoSpec * 0.22 * baseAo * specScale)
+        vec3 color = metalAlbedo * diffuseRgb * baseAo
+          + STUDIO_KEY_WARM * vec3(0.84, 0.86, 0.89) * (anisoSpec * 0.22 * baseAo * specScale)
           + iblSpec * (0.04 + 0.14 * fresnel) * baseAo * specScale * mix(0.45, 1.0, castShadow)
-          + vec3(0.24, 0.26, 0.30) * dirChamfer * (1.0 + uPressDepth * 0.2) * specScale;
+          + (STUDIO_KEY_WARM * chamferKeyFacing + vec3(0.98, 0.99, 1.02) * chamferRimFacing) * chamferMask * vec3(0.24, 0.25, 0.28) * (1.0 + uPressDepth * 0.2) * specScale;
 
         if (uRadialAnisotropy < 0.5) {
           vec2 spatialAo = sampleUrbanSpatialAo(uGroundAoMap, vWorldPos.xz, uBasinRadius);
