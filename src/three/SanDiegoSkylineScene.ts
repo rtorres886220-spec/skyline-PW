@@ -45,8 +45,17 @@ export interface SkylineCallbacks {
   onContextRestored?: () => void;
 }
 
-const DEFAULT_CAMERA_POS = new THREE.Vector3(22.6, 20.6, 32.1);
-const DEFAULT_CAMERA_TARGET = new THREE.Vector3(-0.35, 1.25, 0.35);
+const DEFAULT_CAMERA_POS = new THREE.Vector3(24.6, 22.4, 34.9);
+const DEFAULT_CAMERA_TARGET = new THREE.Vector3(-0.35, 1.15, 0.35);
+const HERO_FOCAL_POINT = new THREE.Vector3(-2.1, 2.2, -0.2);
+
+function computeFovForAspect(aspect: number): number {
+  const baseFov = 31;
+  if (aspect >= 1.22) return baseFov;
+  const halfRad = THREE.MathUtils.degToRad(baseFov * 0.5);
+  const adaptedHalf = Math.atan(Math.tan(halfRad) * (1.22 / Math.max(0.55, aspect)));
+  return Math.min(48, THREE.MathUtils.radToDeg(adaptedHalf) * 2);
+}
 
 // Pre-allocated scratch helpers (zero GC inside render loop)
 const _scratchDir = new THREE.Vector3();
@@ -55,6 +64,11 @@ const _scratchPos = new THREE.Vector3();
 const _scratchQuat = new THREE.Quaternion();
 const _scratchScale = new THREE.Vector3();
 const _scratchEuler = new THREE.Euler();
+const _savedCamPos = new THREE.Vector3();
+const _savedCamQuat = new THREE.Quaternion();
+const _parallaxOffset = new THREE.Vector3();
+const _parallaxRight = new THREE.Vector3();
+const _parallaxUpAxis = new THREE.Vector3(0, 1, 0);
 
 function detectSoftwareWebGL(): boolean {
   try {
@@ -181,11 +195,84 @@ function createCamberedSailGeometry(
   return geo;
 }
 
+/**
+ * Smoothly chamfered architectural pyramid-to-cone crown for One America Plaza.
+ * Transitions gradually from a rounded squircle (p=3.1) at the setback collar to
+ * a circular machined apex collar, with averaged radial seam normals for silky
+ * continuous light-to-shadow wrap instead of a stark two-tone facet split.
+ */
+function createSmoothPyramidCrownGeometry(
+  baseRadius: number,
+  height: number,
+): THREE.BufferGeometry {
+  const radialSegs = 40;
+  const heightSegs = 10;
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+  const topRadius = 0.048;
+
+  for (let r = 0; r <= heightSegs; r++) {
+    const v = r / heightSegs;
+    const y = v * height;
+    const taper = Math.pow(1 - v, 0.92);
+    const p = 3.1 - v * 1.1; // smooth transition from chamfered square to circular collar
+
+    for (let c = 0; c <= radialSegs; c++) {
+      const u = c / radialSegs;
+      const theta = u * Math.PI * 2;
+      const cosT = Math.cos(theta);
+      const sinT = Math.sin(theta);
+      const superDenom =
+        Math.pow(Math.abs(cosT), p) + Math.pow(Math.abs(sinT), p);
+      const superR = Math.pow(Math.max(1e-5, superDenom), -1 / p);
+      const rad = (topRadius * v + baseRadius * taper * superR) / (1 + v * 0.02);
+
+      positions.push(cosT * rad, y, sinT * rad);
+      uvs.push(u, v);
+    }
+  }
+
+  const stride = radialSegs + 1;
+  for (let r = 0; r < heightSegs; r++) {
+    for (let c = 0; c < radialSegs; c++) {
+      const a = r * stride + c;
+      const b = a + 1;
+      const d = a + stride;
+      const e = d + 1;
+      indices.push(a, d, b, b, d, e);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+
+  // Weld seam normals (c = 0 and c = radialSegs) so circular wrap has zero seam crease
+  const normAttr = geo.getAttribute('normal') as THREE.BufferAttribute;
+  for (let r = 0; r <= heightSegs; r++) {
+    const i0 = r * stride;
+    const i1 = i0 + radialSegs;
+    const nx = (normAttr.getX(i0) + normAttr.getX(i1)) * 0.5;
+    const ny = (normAttr.getY(i0) + normAttr.getY(i1)) * 0.5;
+    const nz = (normAttr.getZ(i0) + normAttr.getZ(i1)) * 0.5;
+    const len = Math.hypot(nx, ny, nz) || 1;
+    normAttr.setXYZ(i0, nx / len, ny / len, nz / len);
+    normAttr.setXYZ(i1, nx / len, ny / len, nz / len);
+  }
+  normAttr.needsUpdate = true;
+
+  return geo;
+}
+
 function buildCompositeHeroTower(
   spec: TowerSpec,
   glassMaterial: THREE.ShaderMaterial,
   metalMaterial: THREE.ShaderMaterial,
   slateMaterial: THREE.ShaderMaterial,
+  lobbyGlassMaterial: THREE.ShaderMaterial = glassMaterial,
 ): THREE.Group {
   const group = new THREE.Group();
   group.position.set(spec.x, 0.08, spec.z);
@@ -193,15 +280,44 @@ function buildCompositeHeroTower(
 
   const { width, depth, height, style } = spec;
 
-  // 1. Grounded dead-matte slate podium base
+  // 1. Grounded dead-matte slate podium frame with recessed warm-lit double-height lobby glazing
   const podiumH = 0.45;
-  const podiumGeo = new THREE.BoxGeometry(width * 1.16, podiumH, depth * 1.16);
-  const podium = new THREE.Mesh(podiumGeo, slateMaterial);
-  podium.position.y = podiumH * 0.5;
-  group.add(podium);
+  const podiumBase = new THREE.Mesh(
+    new THREE.BoxGeometry(width * 1.16, 0.14, depth * 1.16),
+    slateMaterial,
+  );
+  podiumBase.position.y = 0.07;
+  group.add(podiumBase);
+
+  const lobbyCore = new THREE.Mesh(
+    new THREE.BoxGeometry(width * 1.11, 0.24, depth * 1.11),
+    lobbyGlassMaterial,
+  );
+  lobbyCore.position.y = 0.26;
+  group.add(lobbyCore);
+
+  const pierGeo = new THREE.BoxGeometry(0.11, 0.245, 0.11);
+  for (const px of [-1, 1]) {
+    for (const pz of [-1, 1]) {
+      const pier = new THREE.Mesh(pierGeo, slateMaterial);
+      pier.position.set(
+        px * (width * 0.58 - 0.055),
+        0.26,
+        pz * (depth * 0.58 - 0.055),
+      );
+      group.add(pier);
+    }
+  }
+
+  const podiumCrown = new THREE.Mesh(
+    new THREE.BoxGeometry(width * 1.16, 0.075, depth * 1.16),
+    slateMaterial,
+  );
+  podiumCrown.position.y = 0.4125;
+  group.add(podiumCrown);
 
   if (style === 'obelisk') {
-    // One America Plaza / Brookfield style: chamfered glass shaft + vertical pilasters + matte collar + satin metal pyramid crown + tapered antenna mast
+    // One America Plaza / Brookfield style: chamfered glass shaft + vertical pilasters + matte collar + smoothly machined crown + detailed antenna collar & mast
     const shaftH = height * 0.74;
     const shaftGeo = new THREE.CylinderGeometry(
       width * 0.54,
@@ -234,36 +350,63 @@ function buildCompositeHeroTower(
     collar.rotation.y = Math.PI / 8;
     group.add(collar);
 
-    // Iconic satin brushed metal pyramid crown
+    // Smoothly chamfered brushed metal/dark-glass pyramid crown (silky continuous light wrap)
     const crownH = height * 0.19;
-    const crownGeo = new THREE.ConeGeometry(width * 0.45, crownH, 4);
+    const crownGeo = createSmoothPyramidCrownGeometry(width * 0.375, crownH);
     const crown = new THREE.Mesh(crownGeo, metalMaterial);
-    crown.position.y = podiumH + shaftH + collarH + crownH * 0.5;
-    crown.rotation.y = Math.PI / 4;
+    crown.position.y = podiumH + shaftH + collarH;
     group.add(crown);
 
-    // Tapered architectural antenna mast atop crown (One America Plaza signature spire)
+    // Multi-tiered precision-machined upper antenna collar & spire (One America Plaza signature)
     const crownTop = podiumH + shaftH + collarH + crownH;
-    const mastCollar = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.065, 0.095, 0.16, 8),
+    const lowerFlange = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.088, 0.106, 0.068, 24),
       slateMaterial,
     );
-    mastCollar.position.y = crownTop - 0.04;
-    group.add(mastCollar);
+    lowerFlange.position.y = crownTop - 0.025;
+    group.add(lowerFlange);
 
-    const mastH = 1.18;
-    const mast = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.008, 0.036, mastH, 8),
+    const shadowGap = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.064, 0.064, 0.030, 24),
+      slateMaterial,
+    );
+    shadowGap.position.y = crownTop + 0.022;
+    group.add(shadowGap);
+
+    const upperCollar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.046, 0.082, 0.092, 24),
       metalMaterial,
     );
-    mast.position.y = crownTop + mastH * 0.5;
+    upperCollar.position.y = crownTop + 0.082;
+    group.add(upperCollar);
+
+    const mastFerrule = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.036, 0.046, 0.042, 16),
+      slateMaterial,
+    );
+    mastFerrule.position.y = crownTop + 0.148;
+    group.add(mastFerrule);
+
+    const mastH = 1.12;
+    const mast = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.008, 0.035, mastH, 16),
+      metalMaterial,
+    );
+    mast.position.y = crownTop + 0.168 + mastH * 0.5;
     group.add(mast);
 
+    const beaconCollar = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.017, 0.017, 0.045, 12),
+      slateMaterial,
+    );
+    beaconCollar.position.y = crownTop + 0.168 + mastH * 0.62;
+    group.add(beaconCollar);
+
     const needle = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.003, 0.008, 0.28, 6),
+      new THREE.CylinderGeometry(0.003, 0.008, 0.28, 12),
       metalMaterial,
     );
-    needle.position.y = crownTop + mastH + 0.14;
+    needle.position.y = crownTop + 0.168 + mastH + 0.14;
     group.add(needle);
   } else if (style === 'emerald-cluster') {
     // Emerald Plaza: 6 clustered hexagonal glass columns at staggered heights + metallic bevel caps & corner pilasters
@@ -428,6 +571,7 @@ function buildConventionCenter(
   glassMaterial: THREE.ShaderMaterial,
   metalMaterial: THREE.ShaderMaterial,
   slateMaterial: THREE.ShaderMaterial,
+  terminalArchGlassMaterial: THREE.ShaderMaterial = glassMaterial,
 ): THREE.Group {
   const group = new THREE.Group();
   group.position.set(7.4, 0.08, 0.45);
@@ -468,7 +612,7 @@ function buildConventionCenter(
     0.055,
   );
 
-  // 5 iconic vaulted Sails Pavilion roofs along the upper deck + structural arched mullions
+  // 5 iconic vaulted Sails Pavilion roofs along the upper deck + recessed softly lit vaulted bays
   const sailShape = new THREE.Shape();
   sailShape.moveTo(-0.48, 0);
   sailShape.quadraticCurveTo(0, 0.92, 0.48, 0);
@@ -487,6 +631,19 @@ function buildConventionCenter(
   });
   sailGeo.center();
 
+  const archCoreShape = new THREE.Shape();
+  archCoreShape.moveTo(-0.41, 0);
+  archCoreShape.quadraticCurveTo(0, 0.76, 0.41, 0);
+  archCoreShape.closePath();
+
+  const archCoreGeo = new THREE.ExtrudeGeometry(archCoreShape, {
+    depth: 1.44,
+    curveSegments: 20,
+    bevelEnabled: false,
+    steps: 1,
+  });
+  archCoreGeo.center();
+
   const archRibGeo = new THREE.BoxGeometry(0.032, 0.78, 0.04);
 
   for (let i = 0; i < 5; i++) {
@@ -494,6 +651,10 @@ function buildConventionCenter(
     const sailMesh = new THREE.Mesh(sailGeo, metalMaterial);
     sailMesh.position.set(xOffset, hallH + 0.44, -0.1);
     group.add(sailMesh);
+
+    const archBayMesh = new THREE.Mesh(archCoreGeo, terminalArchGlassMaterial);
+    archBayMesh.position.set(xOffset, hallH + 0.39, -0.1);
+    group.add(archBayMesh);
 
     const centerMullion = new THREE.Mesh(archRibGeo, slateMaterial);
     centerMullion.position.set(xOffset, hallH + 0.40, 0.78);
@@ -557,31 +718,31 @@ function buildMidwayPier(
 
 function buildLandmassGeometry(): THREE.ExtrudeGeometry {
   const shape = new THREE.Shape();
-  const r = BASIN_RADIUS - 0.16;
-  const segments = 64;
+  const r = BASIN_RADIUS + 0.08;
+  const segments = 160;
 
-  // Trace seawall from left rim to right rim, then arc around the north back perimeter
-  const xStart = -r * 0.96;
-  const xEnd = r * 0.96;
+  // Trace seawall from left rim to right rim, then arc smoothly around the north/east/west perimeter
+  const xStart = -r * 0.992;
+  const xEnd = r * 0.992;
 
-  const firstZ = Math.min(seawallZ(xStart), Math.sqrt(Math.max(0.1, r * r - xStart * xStart)));
+  const firstZ = Math.min(seawallZ(xStart), Math.sqrt(Math.max(0.05, r * r - xStart * xStart)));
   shape.moveTo(xStart, -firstZ);
 
   for (let i = 1; i <= segments; i++) {
     const x = xStart + (i / segments) * (xEnd - xStart);
-    const maxZ = Math.sqrt(Math.max(0.1, r * r - x * x));
+    const maxZ = Math.sqrt(Math.max(0.05, r * r - x * x));
     const z = Math.min(seawallZ(x), maxZ);
     // Note: Shape is in XY and rotated -PI/2 around X, so shape.y = -worldZ
     shape.lineTo(x, -z);
   }
 
-  // Arc around the north side (negative worldZ -> positive shapeY)
-  const rightAngle = Math.atan2(-Math.min(seawallZ(xEnd), Math.sqrt(r * r - xEnd * xEnd)), xEnd);
+  // Arc cleanly around the rear/right perimeter flush inside the plinth basin wall
+  const rightAngle = Math.atan2(-Math.min(seawallZ(xEnd), Math.sqrt(Math.max(0.05, r * r - xEnd * xEnd))), xEnd);
   let leftAngle = Math.atan2(-firstZ, xStart);
   if (leftAngle < rightAngle) {
     leftAngle += Math.PI * 2;
   }
-  const arcSteps = 48;
+  const arcSteps = 128;
   for (let i = 1; i <= arcSteps; i++) {
     const t = i / arcSteps;
     const angle = rightAngle + t * (leftAngle - rightAngle);
@@ -601,6 +762,152 @@ function buildLandmassGeometry(): THREE.ExtrudeGeometry {
   return geo;
 }
 
+/**
+ * Clean swept dark architectural seawall & beveled concrete coping ribbon
+ * along the Embarcadero waterfront curve, plus an inner perimeter curb
+ * where the city terrain meets the plinth ring so zero jagged grid edges appear.
+ */
+function buildSeawallCopingGeometry(): THREE.BufferGeometry {
+  const rWall = BASIN_RADIUS + 0.12;
+  const xSpan = rWall * 0.988;
+  const steps = 160;
+
+  // Cross-section profile in (outwardOffset, y): land-side edge -> beveled coping cap -> battered seawall toe
+  const profile: Array<[number, number]> = [
+    [-0.25, 0.145],
+    [-0.22, 0.184],
+    [0.055, 0.184],
+    [0.080, 0.156],
+    [0.088, -0.025],
+  ];
+  const profLen = profile.length;
+
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+
+  const pts: Array<{ x: number; z: number }> = [];
+  for (let i = 0; i <= steps; i++) {
+    const x = -xSpan + (i / steps) * (xSpan * 2);
+    const maxZ = Math.sqrt(Math.max(0.02, rWall * rWall - x * x));
+    const z = Math.min(seawallZ(x), maxZ);
+    pts.push({ x, z });
+  }
+
+  for (let i = 0; i <= steps; i++) {
+    const prev = pts[Math.max(0, i - 1)];
+    const next = pts[Math.min(steps, i + 1)];
+    let tx = next.x - prev.x;
+    let tz = next.z - prev.z;
+    const tLen = Math.hypot(tx, tz) || 1;
+    tx /= tLen;
+    tz /= tLen;
+
+    // Outward normal facing bay water (+Z side)
+    let nx = -tz;
+    let nz = tx;
+    if (nz < 0) {
+      nx = -nx;
+      nz = -nz;
+    }
+
+    const u = i / steps;
+    const cx = pts[i].x;
+    const cz = pts[i].z;
+
+    for (let k = 0; k < profLen; k++) {
+      const [off, py] = profile[k];
+      const wx = cx + nx * off;
+      const wz = cz + nz * off;
+      // Clamp outer vertices strictly inside basin rim wall
+      const rad = Math.hypot(wx, wz);
+      const scale = rad > rWall + 0.02 ? (rWall + 0.02) / rad : 1;
+      positions.push(wx * scale, py, wz * scale);
+      uvs.push(u * 24, k / (profLen - 1));
+    }
+  }
+
+  for (let i = 0; i < steps; i++) {
+    for (let k = 0; k < profLen - 1; k++) {
+      const a = i * profLen + k;
+      const b = a + 1;
+      const d = a + profLen;
+      const e = d + 1;
+      indices.push(a, d, b, b, d, e);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/**
+ * Clean beveled concrete retaining curb tracing ONLY the land arc along the
+ * rear/side perimeter inside the plinth rim, meeting both ends of the Embarcadero seawall coping.
+ */
+function buildPerimeterCurbGeometry(): THREE.BufferGeometry {
+  const r = BASIN_RADIUS + 0.10;
+  const xStart = -r * 0.992;
+  const xEnd = r * 0.992;
+  const firstZ = Math.min(seawallZ(xStart), Math.sqrt(Math.max(0.05, r * r - xStart * xStart)));
+  const lastZ = Math.min(seawallZ(xEnd), Math.sqrt(Math.max(0.05, r * r - xEnd * xEnd)));
+
+  const rightAngle = Math.atan2(-lastZ, xEnd);
+  let leftAngle = Math.atan2(-firstZ, xStart);
+  if (leftAngle < rightAngle) {
+    leftAngle += Math.PI * 2;
+  }
+
+  const steps = 128;
+  // Cross-section in (radialOffsetFromR, y): inward on land -> beveled cap -> outer plinth wall
+  const profile: Array<[number, number]> = [
+    [-0.24, 0.145],
+    [-0.20, 0.184],
+    [0.015, 0.184],
+    [0.04, 0.155],
+    [0.045, 0.015],
+  ];
+  const profLen = profile.length;
+
+  const positions: number[] = [];
+  const uvs: number[] = [];
+  const indices: number[] = [];
+
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const angle = rightAngle + t * (leftAngle - rightAngle);
+    const cosA = Math.cos(angle);
+    const sinA = Math.sin(angle);
+    for (let k = 0; k < profLen; k++) {
+      const [radOff, py] = profile[k];
+      const rad = r + radOff;
+      positions.push(cosA * rad, py, -sinA * rad);
+      uvs.push(t * 28, k / (profLen - 1));
+    }
+  }
+
+  for (let i = 0; i < steps; i++) {
+    for (let k = 0; k < profLen - 1; k++) {
+      const a = i * profLen + k;
+      const b = a + 1;
+      const d = a + profLen;
+      const e = d + 1;
+      indices.push(a, d, b, b, d, e);
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setIndex(indices);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 export function createSanDiegoSkylineScene(
   container: HTMLElement,
   callbacks: SkylineCallbacks = {},
@@ -611,13 +918,18 @@ export function createSanDiegoSkylineScene(
     window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0f0f11);
-  scene.fog = new THREE.FogExp2(0x0f0f11, 0.0075);
+  scene.background = null;
+  scene.fog = new THREE.FogExp2(0x131315, 0.0068);
 
   const width = Math.max(container.clientWidth, 320);
   const height = Math.max(container.clientHeight, 320);
 
-  const camera = new THREE.PerspectiveCamera(31, width / height, 0.1, 160);
+  const camera = new THREE.PerspectiveCamera(
+    computeFovForAspect(width / height),
+    width / height,
+    0.1,
+    160,
+  );
   camera.position.copy(DEFAULT_CAMERA_POS);
 
   const renderer = new THREE.WebGLRenderer({
@@ -686,6 +998,17 @@ export function createSanDiegoSkylineScene(
     initialPreset,
   );
 
+  const seawallLights = generateSeawallLights(32);
+  const heroLobbyZones = [
+    ...HERO_LANDMARKS.map((t) => ({
+      x: t.x,
+      z: t.z,
+      radius: Math.max(t.width, t.depth) * 0.62,
+      strength: 0.92,
+    })),
+    { x: 7.4, z: 1.45, radius: 1.55, strength: 0.62 },
+  ];
+
   // Shared monochrome architectural scale-model materials (zero wireframe edge lines)
   const heroGlassMat = createSdfGlassMaterial(
     textures.architecturalGrainMap,
@@ -696,8 +1019,8 @@ export function createSanDiegoSkylineScene(
     {
       mullionDensity: 13,
       floorDensity: 17,
-      baseTint: 0x101216,
-      edgeLuminance: 0.88,
+      baseTint: 0x0a0c10,
+      edgeLuminance: 0.92,
       isHero: true,
       allowSideChamfers: true,
     },
@@ -712,10 +1035,44 @@ export function createSanDiegoSkylineScene(
     {
       mullionDensity: 9,
       floorDensity: 12,
-      baseTint: 0x0e1014,
-      edgeLuminance: 0.55,
+      baseTint: 0x080a0d,
+      edgeLuminance: 0.68,
       isHero: false,
       allowSideChamfers: true,
+    },
+  );
+
+  const heroLobbyGlassMat = createSdfGlassMaterial(
+    textures.architecturalGrainMap,
+    lightingRig.studioIblMap,
+    textures.microImperfectionMap,
+    textures.groundContactAoMap,
+    BASIN_RADIUS,
+    {
+      mullionDensity: 15,
+      floorDensity: 8,
+      baseTint: 0x0a0c10,
+      edgeLuminance: 0.78,
+      isHero: true,
+      allowSideChamfers: true,
+      interiorMode: 'lobby',
+    },
+  );
+
+  const terminalArchGlassMat = createSdfGlassMaterial(
+    textures.architecturalGrainMap,
+    lightingRig.studioIblMap,
+    textures.microImperfectionMap,
+    textures.groundContactAoMap,
+    BASIN_RADIUS,
+    {
+      mullionDensity: 14,
+      floorDensity: 6,
+      baseTint: 0x090b0f,
+      edgeLuminance: 0.56,
+      isHero: true,
+      allowSideChamfers: false,
+      interiorMode: 'terminal-arch',
     },
   );
 
@@ -725,7 +1082,7 @@ export function createSanDiegoSkylineScene(
     textures.microImperfectionMap,
     lightingRig.studioIblMap,
     BASIN_RADIUS,
-    { baseColor: 0x1c1e24, masonryWindows: false },
+    { baseColor: 0x1a1c22, masonryWindows: false, seawallLampXZ: seawallLights },
   );
 
   const masonrySlateMat = createMatteSlateMaterial(
@@ -734,7 +1091,7 @@ export function createSanDiegoSkylineScene(
     textures.microImperfectionMap,
     lightingRig.studioIblMap,
     BASIN_RADIUS,
-    { baseColor: 0x22252d, masonryWindows: true },
+    { baseColor: 0x20232b, masonryWindows: true },
   );
 
   const brushedMetalMat = createAnisotropicMetalMaterial(
@@ -773,11 +1130,12 @@ export function createSanDiegoSkylineScene(
   const cycloramaMat = createCycloramaFloorMaterial(
     textures.architecturalGrainMap,
     BASIN_RADIUS,
+    textures.microImperfectionMap,
   );
-  const cycloramaGeo = new THREE.CircleGeometry(BASIN_RADIUS + 10.5, 96);
+  const cycloramaGeo = new THREE.CircleGeometry(BASIN_RADIUS + 10.5, 112);
   cycloramaGeo.rotateX(-Math.PI / 2);
   const cycloramaMesh = new THREE.Mesh(cycloramaGeo, cycloramaMat);
-  cycloramaMesh.position.y = -0.442;
+  cycloramaMesh.position.y = -0.441;
   cycloramaMesh.renderOrder = -1;
   scene.add(cycloramaMesh);
 
@@ -785,20 +1143,31 @@ export function createSanDiegoSkylineScene(
   const dioramaRoot = new THREE.Group();
   scene.add(dioramaRoot);
 
-  // 1. Circular Diorama Plinth & Machined Chamfered Bezel Ring
-  const plinthGeo = new THREE.CylinderGeometry(BASIN_RADIUS + 0.18, BASIN_RADIUS + 0.34, 0.42, 72);
+  // 1. Precision-Machined Circular Anodized Diorama Plinth with 45° Chamfered Rim & Recessed Basin
+  const plinthProfile = [
+    new THREE.Vector2(0.0, -0.44),
+    new THREE.Vector2(BASIN_RADIUS + 0.32, -0.44),
+    new THREE.Vector2(BASIN_RADIUS + 0.34, -0.415),
+    new THREE.Vector2(BASIN_RADIUS + 0.34, -0.39),
+    new THREE.Vector2(BASIN_RADIUS + 0.25, -0.048),
+    new THREE.Vector2(BASIN_RADIUS + 0.18, 0.024),
+    new THREE.Vector2(BASIN_RADIUS + 0.145, 0.024),
+    new THREE.Vector2(BASIN_RADIUS + 0.14, -0.025),
+    new THREE.Vector2(0.0, -0.025),
+  ];
+  const plinthGeo = new THREE.LatheGeometry(plinthProfile, 128);
+  plinthGeo.computeVertexNormals();
   const plinth = new THREE.Mesh(plinthGeo, plinthMetalMat);
-  plinth.position.y = -0.23;
   plinth.receiveShadow = true;
   dioramaRoot.add(plinth);
 
-  const rimRingGeo = new THREE.TorusGeometry(BASIN_RADIUS + 0.16, 0.020, 10, 96);
+  const rimRingGeo = new THREE.TorusGeometry(BASIN_RADIUS + 0.155, 0.014, 12, 128);
   rimRingGeo.rotateX(Math.PI / 2);
   const rimRing = new THREE.Mesh(rimRingGeo, plinthMetalMat);
-  rimRing.position.y = 0.01;
+  rimRing.position.y = 0.020;
   dioramaRoot.add(rimRing);
 
-  // 2. Urban Landmass with dead-matte slate/concrete, canyon AO & raymarched cast shadows
+  // 2. Urban Landmass with dead-matte slate/concrete, canyon AO, raymarched cast shadows & curved seawall coping
   const landGeo = buildLandmassGeometry();
   const landMat = createLandmassObsidianMaterial(
     textures.architecturalGrainMap,
@@ -806,14 +1175,24 @@ export function createSanDiegoSkylineScene(
     textures.microImperfectionMap,
     lightingRig.studioIblMap,
     BASIN_RADIUS,
+    seawallLights,
+    heroLobbyZones,
   );
   const landmass = new THREE.Mesh(landGeo, landMat);
   landmass.position.y = -0.04;
   dioramaRoot.add(landmass);
 
+  const seawallCopingGeo = buildSeawallCopingGeometry();
+  const seawallCoping = new THREE.Mesh(seawallCopingGeo, matteSlateMat);
+  dioramaRoot.add(seawallCoping);
+
+  // Inner curved concrete curb ring along the right/rear terrain perimeter inside the plinth rim
+  const perimeterCurbGeo = buildPerimeterCurbGeometry();
+  const perimeterCurb = new THREE.Mesh(perimeterCurbGeo, matteSlateMat);
+  dioramaRoot.add(perimeterCurb);
+
   // 3. Harbor Water Plane with Real-Time Planar Reflections, Kelvin Wakes & Esplanade Pinpoints
   const WATER_Y = 0.015;
-  const seawallLights = generateSeawallLights(32);
   const reflW = Math.max(256, Math.floor(width * initialDpr * 0.5));
   const reflH = Math.max(256, Math.floor(height * initialDpr * 0.5));
   const reflectionTarget = new THREE.WebGLRenderTarget(reflW, reflH, {
@@ -823,7 +1202,12 @@ export function createSanDiegoSkylineScene(
     magFilter: THREE.LinearFilter,
     depthBuffer: true,
   });
-  const reflectCamera = new THREE.PerspectiveCamera(31, width / height, 0.1, 160);
+  const reflectCamera = new THREE.PerspectiveCamera(
+    computeFovForAspect(width / height),
+    width / height,
+    0.1,
+    160,
+  );
 
   const waterMat = createHarborWaterMaterial(
     textures.waterMicroRippleMap,
@@ -833,14 +1217,15 @@ export function createSanDiegoSkylineScene(
     BASIN_RADIUS,
     seawallLights,
   );
-  const waterGeo = new THREE.CircleGeometry(BASIN_RADIUS - 0.04, 72);
+  waterMat.uniforms.uBoatScales.value = HARBOR_SAILBOATS.map((b) => b.scale);
+  const waterGeo = new THREE.CircleGeometry(BASIN_RADIUS + 0.145, 96);
   waterGeo.rotateX(-Math.PI / 2);
   const waterMesh = new THREE.Mesh(waterGeo, waterMat);
   waterMesh.position.y = WATER_Y;
   dioramaRoot.add(waterMesh);
 
-  // 3b. Real-Time Orthographic Key Shadow Map (1024 GPU / 768 SwiftShader, 16-bit RG depth + 3x3 PCF)
-  const shadowRes = isSoftwareGl ? 768 : 1024;
+  // 3b. Real-Time Orthographic Key Shadow Map (1536 GPU / 768 SwiftShader, 16-bit RG depth + 3x3 PCF)
+  const shadowRes = isSoftwareGl ? 768 : 1536;
   const shadowTarget = new THREE.WebGLRenderTarget(shadowRes, shadowRes, {
     minFilter: THREE.NearestFilter,
     magFilter: THREE.NearestFilter,
@@ -848,12 +1233,14 @@ export function createSanDiegoSkylineScene(
     format: THREE.RGBAFormat,
     depthBuffer: true,
   });
-  const shadowCamera = new THREE.OrthographicCamera(-15.5, 15.5, 15.5, -15.5, 2.0, 52.0);
+  const shadowCamera = new THREE.OrthographicCamera(-14.5, 14.5, 14.5, -14.5, 2.0, 52.0);
   const shadowDepthMat = createShadowDepthMaterial();
 
   const shadowReceiverMats = [
     heroGlassMat,
     urbanGridGlassMat,
+    heroLobbyGlassMat,
+    terminalArchGlassMat,
     matteSlateMat,
     masonrySlateMat,
     brushedMetalMat,
@@ -876,13 +1263,14 @@ export function createSanDiegoSkylineScene(
       heroGlassMat,
       brushedMetalMat,
       matteSlateMat,
+      heroLobbyGlassMat,
     );
     skylineGroup.add(towerGroup);
   }
 
-  // Convention Center & Sails Pavilion (satin brushed metal vaults)
+  // Convention Center & Sails Pavilion (satin brushed metal vaults + soft recessed arch bays)
   skylineGroup.add(
-    buildConventionCenter(heroGlassMat, brushedMetalMat, matteSlateMat),
+    buildConventionCenter(heroGlassMat, brushedMetalMat, matteSlateMat, terminalArchGlassMat),
   );
 
   // USS Midway & Navy Pier
@@ -1019,12 +1407,12 @@ export function createSanDiegoSkylineScene(
 
   // 6. Embarcadero Waterfront Promenade Streetlights (InstancedMesh)
   const poleGeo = new THREE.CylinderGeometry(0.018, 0.024, 0.28, 6);
-  const poleMat = new THREE.MeshBasicMaterial({ color: 0x717580 });
+  const poleMat = new THREE.MeshBasicMaterial({ color: 0x464a54 });
   const poleInstanced = new THREE.InstancedMesh(poleGeo, poleMat, seawallLights.length);
 
   const bulbGeo = new THREE.SphereGeometry(0.048, 8, 8);
   const bulbMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(2.6, 2.7, 2.9),
+    color: new THREE.Color(2.21, 2.24, 2.31),
     toneMapped: false,
   });
   const bulbInstanced = new THREE.InstancedMesh(bulbGeo, bulbMat, seawallLights.length);
@@ -1079,26 +1467,26 @@ export function createSanDiegoSkylineScene(
   const boatGroups: THREE.Group[] = HARBOR_SAILBOATS.map((spec) => {
     const boatGroup = new THREE.Group();
     const hull = new THREE.Mesh(boatHullGeo, matteSlateMat);
-    hull.position.y = 0.006;
+    hull.position.y = 0.0;
 
     const cabin = new THREE.Mesh(cabinGeo, brushedMetalMat);
-    cabin.position.set(0, 0.056, -0.01);
+    cabin.position.set(0, 0.050, -0.01);
 
     const mast = new THREE.Mesh(mastGeo, brushedMetalMat);
-    mast.position.set(0, 0.31, 0.035);
+    mast.position.set(0, 0.304, 0.035);
 
     const boom = new THREE.Mesh(boomGeo, brushedMetalMat);
-    boom.position.set(0, 0.095, -0.075);
+    boom.position.set(0, 0.090, -0.075);
 
     const mainSail = new THREE.Mesh(mainSailGeo, sailMat);
-    mainSail.position.set(0, 0.10, 0.03);
+    mainSail.position.set(0, 0.095, 0.03);
 
     const jibSail = new THREE.Mesh(jibSailGeo, sailMat);
-    jibSail.position.set(0, 0.075, 0.048);
+    jibSail.position.set(0, 0.070, 0.048);
 
     boatGroup.add(hull, cabin, mast, boom, mainSail, jibSail);
     boatGroup.scale.setScalar(spec.scale);
-    boatGroup.position.set(spec.baseX, 0.018, spec.baseZ);
+    boatGroup.position.set(spec.baseX, 0.013, spec.baseZ);
     boatGroup.rotation.y = spec.heading;
     dioramaRoot.add(boatGroup);
     return boatGroup;
@@ -1207,6 +1595,7 @@ export function createSanDiegoSkylineScene(
     const w = Math.max(container.clientWidth, 320);
     const h = Math.max(container.clientHeight, 320);
     const dpr = isSoftwareGl ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+    camera.fov = computeFovForAspect(w / h);
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setPixelRatio(dpr);
@@ -1295,6 +1684,8 @@ export function createSanDiegoSkylineScene(
     const shaderMats = [
       heroGlassMat,
       urbanGridGlassMat,
+      heroLobbyGlassMat,
+      terminalArchGlassMat,
       matteSlateMat,
       masonrySlateMat,
       brushedMetalMat,
@@ -1315,6 +1706,7 @@ export function createSanDiegoSkylineScene(
     }
 
     heroGlassMat.uniforms.uEdgeLuminance.value = currentEdgeGlow;
+    heroLobbyGlassMat.uniforms.uEdgeLuminance.value = currentEdgeGlow * 0.85;
     waterMat.uniforms.uReflectivity.value = currentReflectivity;
     waterMat.uniforms.uTime.value = elapsed;
 
@@ -1333,11 +1725,11 @@ export function createSanDiegoSkylineScene(
 
       boatGroups[i].position.set(
         bx,
-        0.018 + Math.sin(elapsed * 1.8 + spec.phase) * 0.006,
+        0.013 + Math.sin(elapsed * 1.8 + spec.phase) * 0.003,
         bz,
       );
       boatGroups[i].rotation.y = Math.atan2(dirX, dirZ);
-      boatGroups[i].rotation.z = Math.sin(elapsed * 1.4 + spec.phase) * 0.04;
+      boatGroups[i].rotation.z = Math.sin(elapsed * 1.4 + spec.phase) * 0.035;
       boatUniforms[i].set(bx, bz, dirX, dirZ);
     }
 
@@ -1373,6 +1765,8 @@ export function createSanDiegoSkylineScene(
 
     waterMesh.visible = false;
     landmass.visible = false;
+    seawallCoping.visible = false;
+    perimeterCurb.visible = false;
     plinth.visible = false;
     rimRing.visible = false;
     cycloramaMesh.visible = false;
@@ -1394,6 +1788,8 @@ export function createSanDiegoSkylineScene(
 
     waterMesh.visible = true;
     landmass.visible = true;
+    seawallCoping.visible = true;
+    perimeterCurb.visible = true;
     plinth.visible = true;
     rimRing.visible = true;
     cycloramaMesh.visible = true;
@@ -1426,15 +1822,20 @@ export function createSanDiegoSkylineScene(
 
     heroGlassMat.uniforms.uIsReflectPass.value = 1.0;
     urbanGridGlassMat.uniforms.uIsReflectPass.value = 1.0;
+    heroLobbyGlassMat.uniforms.uIsReflectPass.value = 1.0;
+    terminalArchGlassMat.uniforms.uIsReflectPass.value = 1.0;
     matteSlateMat.uniforms.uIsReflectPass.value = 1.0;
     masonrySlateMat.uniforms.uIsReflectPass.value = 1.0;
     brushedMetalMat.uniforms.uIsReflectPass.value = 1.0;
 
     waterMesh.visible = false;
     landmass.visible = false;
+    seawallCoping.visible = false;
+    perimeterCurb.visible = false;
     plinth.visible = false;
     rimRing.visible = false;
     cycloramaMesh.visible = false;
+    poleInstanced.visible = false;
 
     const prevBg = scene.background;
     const prevFog = scene.fog;
@@ -1451,22 +1852,56 @@ export function createSanDiegoSkylineScene(
 
     waterMesh.visible = true;
     landmass.visible = true;
+    seawallCoping.visible = true;
+    perimeterCurb.visible = true;
     plinth.visible = true;
     rimRing.visible = true;
     cycloramaMesh.visible = true;
+    poleInstanced.visible = true;
 
     heroGlassMat.uniforms.uIsReflectPass.value = 0.0;
     urbanGridGlassMat.uniforms.uIsReflectPass.value = 0.0;
+    heroLobbyGlassMat.uniforms.uIsReflectPass.value = 0.0;
+    terminalArchGlassMat.uniforms.uIsReflectPass.value = 0.0;
     matteSlateMat.uniforms.uIsReflectPass.value = 0.0;
     masonrySlateMat.uniforms.uIsReflectPass.value = 0.0;
     brushedMetalMat.uniforms.uIsReflectPass.value = 0.0;
   }
 
   function renderFrame(dt: number) {
-    renderShadowPass();
-    renderReflectionPass();
-    const focusDistance = camera.position.distanceTo(DEFAULT_CAMERA_TARGET);
-    postProcessor.render(scene, camera, dt, focusDistance, []);
+    _savedCamPos.copy(camera.position);
+    _savedCamQuat.copy(camera.quaternion);
+
+    // Subtle RK4 damped-spring cursor parallax camera orbit (±2 deg) without fighting OrbitControls
+    if (!reducedMotion && !canvasPointerDown) {
+      const yaw = -tiltXSpring.value * 0.036;
+      const pitch = -tiltYSpring.value * 0.018;
+      _parallaxOffset.copy(camera.position).sub(controls.target);
+      _parallaxOffset.applyAxisAngle(_parallaxUpAxis, yaw);
+      _parallaxRight.crossVectors(_parallaxUpAxis, _parallaxOffset).normalize();
+      _parallaxOffset.applyAxisAngle(_parallaxRight, pitch);
+      camera.position.copy(controls.target).add(_parallaxOffset);
+      camera.lookAt(controls.target);
+      camera.updateMatrixWorld();
+    }
+
+    try {
+      renderShadowPass();
+      renderReflectionPass();
+      const focusDistance = camera.position.distanceTo(HERO_FOCAL_POINT);
+      postProcessor.render(
+        scene,
+        camera,
+        dt,
+        focusDistance,
+        [],
+        reducedMotion ? 0 : elapsedSeconds,
+      );
+    } finally {
+      camera.position.copy(_savedCamPos);
+      camera.quaternion.copy(_savedCamQuat);
+      camera.updateMatrixWorld();
+    }
   }
 
   function afterDraw(cb: () => void) {
@@ -1569,11 +2004,11 @@ export function createSanDiegoSkylineScene(
     targetEdgeGlow = preset.glassEdgeGlow;
 
     const bloomByPreset: Record<LightingPresetId, number> = {
-      'overhead-studio': 0.24,
-      'grazing-rim': 0.28,
-      'harbor-dusk': 0.32,
+      'overhead-studio': 0.19,
+      'grazing-rim': 0.21,
+      'harbor-dusk': 0.24,
     };
-    postProcessor.setBloomStrength(bloomByPreset[presetId] ?? 0.24);
+    postProcessor.setBloomStrength(bloomByPreset[presetId] ?? 0.19);
 
     if (reducedMotion) requestRender();
   };

@@ -125,20 +125,28 @@ function createProceduralStudioIblMap(maxAnisotropy: number): THREE.DataTexture 
         b += bankMask * 2.13;
       }
 
-      // 2a. Left-side vertical architectural strip light (crisp warm-neutral edge kick)
-      const rimStripA = evalSoftboxDir(dx, dy, dz, -0.82, 0.34, 0.44, 0.16, 0.88, 0.08);
+      // 2a. Left-side vertical architectural strip light (sleek narrow vertical edge kick)
+      const rimStripA = evalSoftboxDir(dx, dy, dz, -0.82, 0.34, 0.44, 0.10, 0.88, 0.055);
       if (rimStripA > 0.001) {
-        r += rimStripA * 2.10;
-        g += rimStripA * 2.08;
-        b += rimStripA * 2.04;
+        r += rimStripA * 2.15;
+        g += rimStripA * 2.16;
+        b += rimStripA * 2.20;
       }
 
-      // 2b. Subtle cool opposite fill strip (restrained ~3:1 contrast)
-      const rimStripB = evalSoftboxDir(dx, dy, dz, 0.78, 0.28, -0.56, 0.18, 0.72, 0.10);
+      // 2b. Subtle cool opposite fill strip (restrained dark-luxury contrast, zero wall wash)
+      const rimStripB = evalSoftboxDir(dx, dy, dz, 0.78, 0.28, -0.56, 0.14, 0.68, 0.08);
       if (rimStripB > 0.001) {
-        r += rimStripB * 0.44;
-        g += rimStripB * 0.51;
-        b += rimStripB * 0.65;
+        r += rimStripB * 0.28;
+        g += rimStripB * 0.33;
+        b += rimStripB * 0.44;
+      }
+
+      // 2c. Razor-narrow right-rear platinum edge strip for crisp silhouette separation on overlapping right towers
+      const rimStripRightEdge = evalSoftboxDir(dx, dy, dz, 0.86, 0.44, -0.25, 0.055, 0.82, 0.035);
+      if (rimStripRightEdge > 0.001) {
+        r += rimStripRightEdge * 2.35;
+        g += rimStripRightEdge * 2.42;
+        b += rimStripRightEdge * 2.55;
       }
 
       // 3. Low grazing horizon bounce strip (catches bay ripples & Sails Pavilion curves)

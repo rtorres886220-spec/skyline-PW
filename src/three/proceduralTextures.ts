@@ -228,11 +228,11 @@ function createSoftboxDiffuserTexture(): THREE.CanvasTexture {
 }
 
 /**
- * Generates a seamless 256x256 procedural high-frequency capillary wind ripple normal map
- * for polished dark smoked harbor resin/water (zero blurry low-frequency smudges).
+ * Generates a seamless 512x512 procedural high-frequency directional capillary wind ripple normal map
+ * for dark harbor water (fine horizontal/cross-bay micro-ripples that gently break up reflections).
  */
 function createWaterMicroRippleTexture(maxAnisotropy: number): THREE.DataTexture {
-  const size = 256;
+  const size = 512;
   const data = new Uint8Array(size * size * 4);
 
   for (let y = 0; y < size; y++) {
@@ -242,22 +242,23 @@ function createWaterMicroRippleTexture(maxAnisotropy: number): THREE.DataTexture
       const u = un * Math.PI * 2;
       const v = vn * Math.PI * 2;
 
-      // Multi-directional crisp capillary wavelets (prime harmonic ratios prevent tiling streaks)
+      // Directional capillary wavelets: stronger cross-wave slope along Z/vertical reflection axis
+      // combined with fine prime-harmonic cross-ripples to prevent repeating grid streaks
       const dx =
-        Math.cos(u * 5 + v * 3) * 0.36 +
-        Math.cos(u * 11 - v * 7) * 0.28 +
-        Math.cos(u * 17 + v * 13) * 0.20 +
-        Math.cos(u * 23 - v * 19) * 0.14;
+        Math.cos(u * 5 + v * 7) * 0.24 +
+        Math.cos(u * 11 - v * 13) * 0.22 +
+        Math.cos(u * 19 + v * 17) * 0.16 +
+        Math.cos(u * 29 - v * 23) * 0.11;
       const dz =
-        Math.sin(v * 7 - u * 4) * 0.36 +
-        Math.sin(v * 13 + u * 9) * 0.28 +
-        Math.sin(v * 19 - u * 15) * 0.20 +
-        Math.sin(v * 29 + u * 21) * 0.14;
+        Math.sin(v * 9 + u * 3) * 0.34 +
+        Math.sin(v * 17 - u * 7) * 0.28 +
+        Math.sin(v * 27 + u * 11) * 0.20 +
+        Math.sin(v * 41 - u * 17) * 0.14;
 
       const idx = (y * size + x) * 4;
       data[idx] = Math.max(0, Math.min(255, Math.round((dx * 0.5 + 0.5) * 255)));
       data[idx + 1] = Math.max(0, Math.min(255, Math.round((dz * 0.5 + 0.5) * 255)));
-      data[idx + 2] = 240;
+      data[idx + 2] = 244;
       data[idx + 3] = 255;
     }
   }

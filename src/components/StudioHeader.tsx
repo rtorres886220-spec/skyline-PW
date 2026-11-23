@@ -42,7 +42,7 @@ export const StudioHeader: React.FC<StudioHeaderProps> = ({ onOpenContact }) => 
         {...talkKey.tactileProps}
         type="button"
         onClick={onOpenContact}
-        className="hw-control shrink-0 whitespace-nowrap rounded-full border border-white/25 bg-white/[0.03] px-6 py-2.5 text-[11px] font-medium tracking-[0.08em] text-[#F4F4F5] uppercase hover:border-white/70 hover:bg-white/[0.08] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
+        className="hw-control hw-control-anodized shrink-0 whitespace-nowrap rounded-full border border-white/[0.16] bg-[#18191E]/95 px-6 py-2.5 text-[11px] font-medium tracking-[0.08em] text-[#F4F4F5] uppercase hover:border-white/45 hover:bg-[#20222A] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white"
       >
         Let&apos;s Talk
       </button>

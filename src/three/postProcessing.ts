@@ -7,6 +7,7 @@ export interface HdrPostProcessor {
     dtSeconds: number,
     focusDistance?: number,
     depthExcludeObjects?: THREE.Object3D[],
+    timeSeconds?: number,
   ) => void;
   setSize: (width: number, height: number, pixelRatio: number) => void;
   setBloomStrength: (strength: number) => void;
@@ -128,7 +129,7 @@ const KAWASE_UPSAMPLE_SHADER = /* glsl */ `
     sum += texture(uSourceTex, vUv + vec2(-hp.x, -hp.y)).rgb * 2.0;
     vec3 blurred = sum / 12.0;
     vec3 detail = texture(uDetailTex, vUv).rgb;
-    fragColor = vec4(blurred + detail * 0.55, 1.0);
+    fragColor = vec4(blurred * 0.72 + detail * 0.65, 1.0);
   }
 `;
 
@@ -152,6 +153,7 @@ const FINAL_COMPOSITE_SHADER = /* glsl */ `
   uniform float uBloomStrength;
   uniform float uHalationStrength;
   uniform float uDitherScale;
+  uniform float uTime;
 
   in vec2 vUv;
   out vec4 fragColor;
@@ -163,22 +165,25 @@ const FINAL_COMPOSITE_SHADER = /* glsl */ `
 
   float computeCoc(float viewDist) {
     // Background sky/void (depth ~0 or >=84) stays gently soft or matches distant edge
-    if (viewDist <= 0.1 || viewDist >= 84.0) return 0.35;
-    // Sharp focal corridor of ±5.2 units around hero waterfront towers
+    if (viewDist <= 0.1 || viewDist >= 84.0) return 0.30;
+    // Razor-sharp focal corridor on hero waterfront towers & Brookfield domes,
+    // whisper-subtle optical softening on far rear blocks & nearest front plinth rim
     float delta = abs(viewDist - uFocusDistance);
-    return clamp((delta - 5.2) / 14.5, 0.0, 1.0);
+    return clamp((delta - 5.4) / 15.5, 0.0, 1.0);
   }
 
-  vec3 sampleOpticalDof(vec2 uv) {
-    vec3 center = max(texture(uHdrSceneTex, uv).rgb, vec3(0.0));
-    if (uDofEnabled < 0.5) return center;
+  vec4 sampleOpticalDof(vec2 uv) {
+    vec4 centerSample = texture(uHdrSceneTex, uv);
+    centerSample.rgb = max(centerSample.rgb, vec3(0.0));
+    centerSample.a = clamp(centerSample.a, 0.0, 1.0);
+    if (uDofEnabled < 0.5 || centerSample.a <= 0.01) return centerSample;
 
     float centerDist = decodeDepth(uv);
     float centerCoc = computeCoc(centerDist);
-    if (centerCoc <= 0.015) return center;
+    if (centerCoc <= 0.015) return centerSample;
 
-    // Subtle optical macro lens radius (max ~2.4 CSS-equivalent px)
-    float radiusPx = centerCoc * 2.4;
+    // Whisper-subtle optical macro lens radius (max ~2.0 CSS-equivalent px)
+    float radiusPx = centerCoc * 2.05;
     vec2 radiusUv = uTexelSize * radiusPx;
 
     const vec2 POISSON_8[8] = vec2[8](
@@ -192,17 +197,22 @@ const FINAL_COMPOSITE_SHADER = /* glsl */ `
       vec2(-1.0000,  0.0000)
     );
 
-    vec3 accum = center;
+    vec4 accum = centerSample;
     float totalW = 1.0;
 
     for (int i = 0; i < 8; i++) {
       vec2 tapUv = clamp(uv + POISSON_8[i] * radiusUv, vec2(0.001), vec2(0.999));
       float tapDist = decodeDepth(tapUv);
       float tapCoc = computeCoc(tapDist);
+      vec4 tapSample = texture(uHdrSceneTex, tapUv);
+      tapSample.rgb = max(tapSample.rgb, vec3(0.0));
+      tapSample.a = clamp(tapSample.a, 0.0, 1.0);
       // Prevent sharp midground hero towers from bleeding into defocused rear/foreground
+      // and prevent transparent sky taps from darkening solid geometry edges
       float bleedGuard = (tapDist < centerDist - 2.0) ? clamp(tapCoc + 0.25, 0.0, 1.0) : max(tapCoc, centerCoc * 0.65);
-      float w = 0.75 * bleedGuard;
-      accum += max(texture(uHdrSceneTex, tapUv).rgb, vec3(0.0)) * w;
+      float alphaGuard = mix(1.0, tapSample.a, step(0.5, centerSample.a));
+      float w = 0.75 * bleedGuard * alphaGuard;
+      accum += tapSample * w;
       totalW += w;
     }
     return accum / totalW;
@@ -267,28 +277,48 @@ const FINAL_COMPOSITE_SHADER = /* glsl */ `
   }
 
   void main() {
-    vec3 hdrScene = sampleOpticalDof(vUv);
+    vec4 hdrSample = sampleOpticalDof(vUv);
     vec3 bloom = max(texture(uBloomTex, vUv).rgb, vec3(0.0));
     vec3 halation = max(texture(uHalationTex, vUv).rgb, vec3(0.0));
 
-    vec3 combinedHdr = hdrScene
-      + bloom * uBloomStrength
+    vec3 glowHdr = bloom * uBloomStrength
       + halation * vec3(0.95, 0.97, 1.02) * uHalationStrength;
+    float glowLum = max(glowHdr.r, max(glowHdr.g, glowHdr.b));
+
+    float sceneAlpha = clamp(hdrSample.a, 0.0, 1.0);
+    float outAlpha = clamp(max(sceneAlpha, glowLum * 1.4), 0.0, 1.0);
+
+    // Un-premultiply linear HDR over transparent sky before AgX tone mapping (guarded against 8-bit halo banding)
+    float unpremulDiv = max(sceneAlpha, glowLum * 1.4 + 0.12 * (1.0 - sceneAlpha));
+    vec3 combinedHdr = outAlpha > 0.002
+      ? (hdrSample.rgb + glowHdr) / max(unpremulDiv, 0.002)
+      : vec3(0.0);
 
     vec3 toneMapped = agxToneMap(combinedHdr * uExposure);
     vec3 srgb = linearToSRGB(toneMapped);
 
-    float n1 = interleavedGradientNoise(gl_FragCoord.xy);
-    float n2 = interleavedGradientNoise(gl_FragCoord.xy + vec2(37.0, 17.0));
-    float dither = ((n1 - n2) * 0.75) * uDitherScale;
+    // Animated blue-noise-style spatio-temporal sensor grain (~1.5% opacity across dark gradients)
+    vec2 frameShift = vec2(
+      fract(uTime * 11.731) * 131.0,
+      fract(uTime * 17.397) * 197.0
+    );
+    vec2 grainCoord = gl_FragCoord.xy + frameShift;
+    float n1 = interleavedGradientNoise(grainCoord);
+    float n2 = interleavedGradientNoise(grainCoord + vec2(37.0, 17.0));
+    float blueNoise = (n1 - n2); // zero-mean high-frequency triangular distribution in [-1, 1]
+    float dither = blueNoise * 0.75 * uDitherScale;
+    float lum = dot(srgb, vec3(0.2126, 0.7152, 0.0722));
+    float darkToneWeight = mix(1.0, 0.38, smoothstep(0.04, 0.55, lum));
+    float sensorGrain = blueNoise * 0.015 * darkToneWeight * step(0.02, outAlpha);
 
-    float edgeAlpha =
-      smoothstep(0.0, 0.025, vUv.x) *
-      smoothstep(1.0, 0.92, vUv.x) *
-      smoothstep(0.0, 0.04, vUv.y) *
-      smoothstep(1.0, 0.92, vUv.y);
+    // Gentle 1.5% border safety feather only at the extreme viewport perimeter
+    float borderFeather =
+      smoothstep(0.0, 0.015, vUv.x) *
+      smoothstep(1.0, 0.985, vUv.x) *
+      smoothstep(0.0, 0.015, vUv.y) *
+      smoothstep(1.0, 0.985, vUv.y);
 
-    fragColor = vec4(clamp(srgb + vec3(dither), 0.0, 1.0), edgeAlpha);
+    fragColor = vec4(clamp(srgb + vec3(dither + sensorGrain), 0.0, 1.0), outAlpha * borderFeather);
   }
 `;
 
@@ -388,8 +418,8 @@ export function createHdrPostProcessor(
     uniforms: {
       uSourceTex: { value: null },
       uTexelSize: { value: new THREE.Vector2(1 / wPx, 1 / hPx) },
-      uThreshold: { value: 0.92 },
-      uSoftKnee: { value: 0.45 },
+      uThreshold: { value: 0.88 },
+      uSoftKnee: { value: 0.22 },
     },
     vertexShader: FULLSCREEN_VERTEX_SHADER,
     fragmentShader: PREFILTER_FRAGMENT_SHADER,
@@ -415,7 +445,7 @@ export function createHdrPostProcessor(
       uSourceTex: { value: null },
       uDetailTex: { value: null },
       uHalfPixel: { value: new THREE.Vector2(0.001, 0.001) },
-      uScatter: { value: 1.15 },
+      uScatter: { value: 0.52 },
     },
     vertexShader: FULLSCREEN_VERTEX_SHADER,
     fragmentShader: KAWASE_UPSAMPLE_SHADER,
@@ -434,9 +464,10 @@ export function createHdrPostProcessor(
       uFocusDistance: { value: 44.0 },
       uDofEnabled: { value: 1.0 },
       uExposure: { value: 1.65 },
-      uBloomStrength: { value: 0.24 },
-      uHalationStrength: { value: 0.14 },
+      uBloomStrength: { value: 0.19 },
+      uHalationStrength: { value: 0.018 },
       uDitherScale: { value: 1.0 / 255.0 },
+      uTime: { value: 0.0 },
     },
     vertexShader: FULLSCREEN_VERTEX_SHADER,
     fragmentShader: FINAL_COMPOSITE_SHADER,
@@ -472,11 +503,13 @@ export function createHdrPostProcessor(
     dtSeconds: number,
     focusDistance = 44.0,
     depthExcludeObjects: THREE.Object3D[] = [],
+    timeSeconds = 0,
   ) => {
     updateFrameBudget(dtSeconds);
 
-    // 1. Render scene into linear HDR FBO (RGBA16F)
+    // 1. Render scene into linear HDR FBO (RGBA16F) with transparent backdrop alpha = 0
     renderer.setRenderTarget(hdrTarget);
+    renderer.setClearColor(0x000000, 0);
     renderer.clear();
     renderer.render(scene, camera);
 
@@ -540,6 +573,7 @@ export function createHdrPostProcessor(
     compositeMat.uniforms.uDepthTex.value = depthTarget.texture;
     compositeMat.uniforms.uTexelSize.value.set(1 / hdrTarget.width, 1 / hdrTarget.height);
     compositeMat.uniforms.uFocusDistance.value = focusDistance;
+    compositeMat.uniforms.uTime.value = timeSeconds;
     quadMesh.material = compositeMat;
     renderer.setRenderTarget(null);
     renderer.render(postScene, postCamera);

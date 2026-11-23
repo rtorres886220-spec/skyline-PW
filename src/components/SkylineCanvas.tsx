@@ -54,27 +54,21 @@ export const SkylineCanvas: React.FC<SkylineCanvasProps> = ({
       data-webgl-ready={ready ? 'true' : 'false'}
       data-lighting-preset={lightingPreset}
     >
-      {/* Isolated WebGL mount container with feathered radial vignette */}
+      {/* Isolated WebGL mount container with seamless alpha compositing */}
       <div
         ref={mountRef}
         data-testid="skyline-canvas"
         aria-label="Interactive 3D monochrome diorama of the San Diego Bay skyline and Convention Center"
         role="img"
-        style={{
-          maskImage:
-            'radial-gradient(ellipse 78% 76% at 50% 50%, #000 54%, transparent 94%)',
-          WebkitMaskImage:
-            'radial-gradient(ellipse 78% 76% at 50% 50%, #000 54%, transparent 94%)',
-        }}
         className="h-full w-full cursor-grab active:cursor-grabbing"
       />
 
       {!ready && !contextLost && (
         <div
           aria-hidden="true"
-          className="pointer-events-none absolute inset-0 flex items-center justify-center bg-[#111113]"
+          className="pointer-events-none absolute inset-0 flex items-center justify-center"
         >
-          <div className="h-[68%] w-[68%] rounded-full border border-white/10 bg-radial from-white/[0.04] via-transparent to-transparent" />
+          <div className="h-[64%] w-[64%] rounded-full border border-white/10 bg-radial from-white/[0.04] via-transparent to-transparent" />
         </div>
       )}
 

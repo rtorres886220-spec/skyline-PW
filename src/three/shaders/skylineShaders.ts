@@ -18,9 +18,14 @@ export interface TowerReflector {
 const GLSL3_OPTICS_COMMON = /* glsl */ `
 const float PI = 3.14159265359;
 const float INV_TWO_PI = 0.15915494309;
-const vec3 STUDIO_KEY_WARM = vec3(1.032, 1.000, 0.962);
+const vec3 STUDIO_KEY_WARM = vec3(0.996, 1.003, 1.012);
 const vec3 STUDIO_FILL_COOL = vec3(0.935, 0.972, 1.052);
-const vec3 STUDIO_INTERIOR_IVORY = vec3(0.76, 0.70, 0.61);
+const vec3 STUDIO_INTERIOR_ALABASTER = vec3(0.816, 0.824, 0.840);
+const vec3 STUDIO_INTERIOR_CHAMPAGNE = vec3(0.774, 0.788, 0.814);
+const vec3 STUDIO_INTERIOR_DAYLIGHT = vec3(0.742, 0.794, 0.880);
+const vec3 STUDIO_INTERIOR_LOBBY = vec3(0.706, 0.715, 0.732);
+const vec3 STUDIO_WARM_POOL_3000K = vec3(0.696, 0.707, 0.728);
+const vec3 STUDIO_PLATINUM_RIM = vec3(0.88, 0.92, 0.99);
 
 float fresnelSchlick(float cosTheta, float F0) {
   return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
@@ -96,7 +101,7 @@ float sampleOrthographicShadowPCF(
   }
   vec3 dir = normalize(keyDir);
   float slope = 1.0 - clamp(dot(surfaceN, dir), 0.0, 1.0);
-  vec3 biasedWorld = worldPos + surfaceN * (0.042 + 0.058 * slope);
+  vec3 biasedWorld = worldPos + surfaceN * (0.028 + 0.040 * slope);
   vec4 shadowClip = shadowMatrix * vec4(biasedWorld, 1.0);
   vec3 shadowCoord = (shadowClip.xyz / max(0.0001, shadowClip.w)) * 0.5 + 0.5;
 
@@ -108,8 +113,8 @@ float sampleOrthographicShadowPCF(
     return 1.0;
   }
 
-  float depthBias = 0.0026 + 0.0034 * slope;
-  vec2 texel = shadowTexelSize * 1.45;
+  float depthBias = 0.0018 + 0.0024 * slope;
+  vec2 texel = shadowTexelSize * 1.25;
   float sum = 0.0;
 
   for (int ix = -1; ix <= 1; ix++) {
@@ -120,7 +125,7 @@ float sampleOrthographicShadowPCF(
     }
   }
 
-  return clamp(mix(0.06, 1.0, sum / 9.0), 0.06, 1.0);
+  return clamp(mix(0.035, 1.0, sum / 9.0), 0.035, 1.0);
 }
 
 /**
@@ -193,19 +198,72 @@ vec4 computeMachinedChamfer(
   B *= invMax;
 
   vec2 fwUv = clamp(fwidth(uv), vec2(0.0004), vec2(0.08));
+  float inUnitU = step(-0.002, uv.x) * step(uv.x, 1.002);
+  float inUnitV = step(-0.002, uv.y) * step(uv.y, 1.002);
+  float inUnitUv = inUnitU * inUnitV;
+
   float edgeY = min(uv.y, 1.0 - uv.y);
-  float maskY = 1.0 - smoothstep(0.0, max(fwUv.y * 1.9, 0.010), edgeY);
+  float maskY = (1.0 - smoothstep(0.0, max(fwUv.y * 1.45, 0.0045), edgeY)) * inUnitUv;
   float signY = uv.y > 0.5 ? 1.0 : -1.0;
 
   float edgeX = min(uv.x, 1.0 - uv.x);
   float uvWrapGuard = 1.0 - smoothstep(0.08, 0.25, fwUv.x);
-  float maskX = (1.0 - smoothstep(0.0, max(fwUv.x * 1.9, 0.010), edgeX)) * allowSideEdges * uvWrapGuard;
+  float maskX = (1.0 - smoothstep(0.0, max(fwUv.x * 1.45, 0.0045), edgeX)) * allowSideEdges * uvWrapGuard * inUnitUv;
   float signX = uv.x > 0.5 ? 1.0 : -1.0;
 
   vec3 tilt = T * (signX * maskX) + B * (signY * maskY);
   float chamferMask = clamp(max(maskX, maskY), 0.0, 1.0);
   vec3 chamferN = normalize(N + tilt * bevelStrength * chamferMask);
   return vec4(chamferN, chamferMask);
+}
+
+/**
+ * Razor-thin platinum edge rim glint ONLY along sharp vertical corners,
+ * stepped setbacks, and rooftop parapet edges — zero broad diffuse bleed across flat walls.
+ */
+vec3 computePlatinumEdgeGlint(
+  vec3 baseN,
+  vec3 chamferN,
+  vec3 V,
+  vec3 keyL,
+  float chamferMask,
+  float rimInt,
+  float keyInt
+) {
+  float normalCrease = clamp(smoothstep(0.16, 0.72, length(fwidth(baseN))), 0.0, 1.0);
+  float edgeSupport = clamp(max(chamferMask, normalCrease * 0.92), 0.0, 1.0);
+  if (edgeSupport < 0.005) {
+    return vec3(0.0);
+  }
+
+  vec3 edgeN = normalize(mix(baseN, chamferN, chamferMask));
+  float ndv = clamp(dot(edgeN, V), 0.0, 1.0);
+  float steepFresnel = pow(1.0 - ndv, 4.4);
+
+  vec3 rightRimL = normalize(vec3(0.88, 0.44, -0.22));
+  vec3 leftRimL = normalize(vec3(-0.82, 0.46, 0.34));
+  vec3 zenithRimL = normalize(vec3(0.22, 0.94, -0.26));
+
+  vec3 H_right = normalize(rightRimL + V);
+  vec3 H_left = normalize(leftRimL + V);
+  vec3 H_zen = normalize(zenithRimL + V);
+  vec3 H_key = normalize(keyL + V);
+
+  float specRight = pow(max(dot(edgeN, H_right), 0.0), 26.0);
+  float specLeft = pow(max(dot(edgeN, H_left), 0.0), 28.0);
+  float specZen = pow(max(dot(edgeN, H_zen), 0.0), 24.0);
+  float specKey = pow(max(dot(edgeN, H_key), 0.0), 28.0);
+
+  float rightSideWeight = smoothstep(-0.30, 0.60, edgeN.x) * 0.65 + 0.35;
+  float roofEdgeBoost = smoothstep(0.35, 0.85, edgeN.y) * 0.45 + 0.55;
+
+  float glint = edgeSupport * (
+    steepFresnel * (0.42 + 0.78 * rightSideWeight) * rimInt +
+    (specRight * 1.45 + specLeft * 0.85 + specZen * 0.95) * rimInt * roofEdgeBoost +
+    specKey * 0.55 * keyInt
+  );
+
+  return STUDIO_PLATINUM_RIM * glint;
 }
 
 /**
@@ -274,6 +332,7 @@ export function createHarborWaterMaterial(
 ): THREE.ShaderMaterial {
   // Vector4(x, z, dirX, dirZ) for instantaneous sailboat position & heading
   const boatStates = Array.from({ length: 6 }, () => new THREE.Vector4(0, 100, 1, 0));
+  const boatScales = [1, 1, 1, 1, 1, 1];
   const paddedLamps: THREE.Vector2[] = [];
   for (let i = 0; i < 32; i++) {
     const l = seawallLampXZ[i];
@@ -305,6 +364,7 @@ export function createHarborWaterMaterial(
       uTiltVec: { value: new THREE.Vector2(0, 0) },
       uVelocity: { value: new THREE.Vector2(0, 0) },
       uBoats: { value: boatStates },
+      uBoatScales: { value: boatScales },
       uLamps: { value: paddedLamps },
       uLampCount: { value: Math.min(32, seawallLampXZ.length) },
     },
@@ -343,6 +403,7 @@ export function createHarborWaterMaterial(
       uniform vec2 uTiltVec;
       uniform vec2 uVelocity;
       uniform vec4 uBoats[6];
+      uniform float uBoatScales[6];
       uniform vec2 uLamps[32];
       uniform int uLampCount;
 
@@ -360,8 +421,9 @@ export function createHarborWaterMaterial(
 
       void main() {
         vec2 p = vWorldPos.xz;
+        float rimRadius = uBasinRadius + 0.145;
         float distFromCenter = length(p);
-        if (distFromCenter > uBasinRadius - 0.04) {
+        if (distFromCenter > rimRadius) {
           discard;
         }
 
@@ -371,55 +433,91 @@ export function createHarborWaterMaterial(
           discard;
         }
 
-        // Crisp high-frequency capillary wind ripple normals (zero cloudy smudges or blobs)
-        vec2 uvA = p * 0.34 + vec2(uTime * 0.022, uTime * 0.014);
-        vec2 uvB = p * 0.68 - vec2(uTime * 0.028, -uTime * 0.019);
+        // 1. Fine high-frequency directional capillary wave normals (sheltered near seawall, richer out in the bay)
+        float openBayFactor = mix(0.68, 1.38, smoothstep(0.0, 4.8, max(0.0, shoreDist)));
+        vec2 uvA = p * 0.62 + vec2(uTime * 0.018, uTime * 0.012);
+        vec2 uvB = p * 1.38 - vec2(uTime * 0.024, -uTime * 0.016);
         vec2 nA = texture(uWaterRippleMap, uvA).xy * 2.0 - 1.0;
         vec2 nB = texture(uWaterRippleMap, uvB).xy * 2.0 - 1.0;
 
-        // Subtle cross-wind capillary wavelets
-        float capX = cos(p.x * 3.8 + p.y * 1.4 + uTime * 1.3) * 0.008;
-        float capZ = sin(p.y * 4.4 - p.x * 1.1 + uTime * 1.15) * 0.009;
+        // Directional micro-capillary wind wavelets (finer horizontal bands across the harbor)
+        float capX = cos(p.x * 6.4 + p.y * 2.3 + uTime * 1.25) * 0.011
+                   + cos(p.x * 13.5 - p.y * 4.8 - uTime * 1.6) * 0.008;
+        float capZ = sin(p.y * 11.2 + p.x * 1.9 + uTime * 1.15) * 0.018
+                   + sin(p.y * 21.5 - p.x * 3.4 + uTime * 1.55) * 0.012;
 
-        // Realistic V-shaped Kelvin wake wave normals & bow ripple etched cleanly behind each 3D sailboat
+        // 2. Miniature sailboat hull contact ripples & crisp V-shaped Kelvin wake etched purely into water normals
         vec2 wakeGrad = vec2(0.0);
-        float wakeCrestMask = 0.0;
+        float boatContactAo = 1.0;
         for (int i = 0; i < 6; i++) {
           vec4 b = uBoats[i];
           vec2 dBoat = p - b.xy;
-          if (dot(dBoat, dBoat) < 9.5) {
+          if (dot(dBoat, dBoat) < 4.5) {
+            float sc = max(0.65, uBoatScales[i]);
             vec2 fwd = normalize(b.zw);
             vec2 right = vec2(-fwd.y, fwd.x);
-            float back = -dot(dBoat, fwd);
+            float fwdCoord = dot(dBoat, fwd);   // + along bow
+            float back = -fwdCoord;             // + behind stern
             float side = dot(dBoat, right);
-            if (back > -0.10 && back < 2.95) {
-              // Kelvin 19.47° half-angle V-wake arms (tan(19.47°) ≈ 0.354)
-              float armOffset = 0.042 + max(0.0, back) * 0.354;
-              float armDist = abs(abs(side) - armOffset);
-              float env = exp(-max(0.0, back) * 0.72) * smoothstep(-0.08, 0.12, back);
-              float vArm = exp(-pow(armDist / (0.032 + max(0.0, back) * 0.014), 2.0)) * env;
-              // Crisp divergent feather crests along both V-arms
-              float crestWave = cos(armDist * 58.0 - uTime * 3.4) * vArm;
+
+            // Tight elliptical hull contact shadow & waterline meniscus hugging the hull
+            float hullNx = side / (0.062 * sc);
+            float hullNz = (fwdCoord + 0.02 * sc) / (0.185 * sc);
+            float hullEllip = sqrt(hullNx * hullNx + hullNz * hullNz);
+            boatContactAo = min(boatContactAo, mix(0.32, 1.0, smoothstep(0.75, 1.35, hullEllip)));
+
+            if (hullEllip > 0.72 && hullEllip < 3.6) {
+              float hullRing = max(0.0, hullEllip - 0.90);
+              float contactWave = cos(hullRing * 62.0 - uTime * 2.6) * exp(-hullRing * 2.05);
+              vec2 radialHull = normalize(right * hullNx + fwd * hullNz + vec2(1e-5));
+              wakeGrad += radialHull * contactWave * 0.115;
+            }
+
+            // Crisp Kelvin 19.47° half-angle V-wake & divergent wavelets catching specular studio light
+            float bowBack = back + 0.14 * sc;
+            if (bowBack > 0.0 && bowBack < 1.95 * sc) {
+              float armOffset = 0.022 * sc + bowBack * 0.354;
+              float armDist = abs(side) - armOffset;
+              float env = exp(-bowBack / (0.86 * sc)) * smoothstep(0.0, 0.12 * sc, bowBack);
+              float armBand = exp(-pow(armDist / (0.015 * sc + bowBack * 0.010), 2.0)) * env;
+
+              // Crisp divergent echelon wavelets angled along the Kelvin V-arms
+              float echelonPhase = abs(side) * 74.0 - bowBack * 28.0 - uTime * 2.8;
+              float crestWave = cos(echelonPhase) * armBand;
               vec2 armNormalDir = normalize(right * (side >= 0.0 ? 1.0 : -1.0) - fwd * 0.354);
-              wakeGrad += armNormalDir * crestWave * 0.28;
-              wakeCrestMask += max(0.0, crestWave) * 0.85 + vArm * 0.45;
-              // Subtle bow parting wave & transverse stern ripples inside the V-wedge
-              float bowRipple = exp(-pow(back / 0.06, 2.0)) * exp(-pow(abs(side) / 0.075, 2.0));
-              wakeGrad += (right * (side >= 0.0 ? 1.0 : -1.0) + fwd * 0.6) * bowRipple * 0.18;
-              wakeCrestMask += bowRipple * 0.65;
-              if (abs(side) < armOffset * 0.92 && back > 0.04) {
-                float trans = sin(back * 26.0 - uTime * 3.2) * exp(-back * 1.15) * 0.07;
-                wakeGrad += fwd * trans;
-                wakeCrestMask += max(0.0, trans) * 1.4;
+              wakeGrad += armNormalDir * crestWave * 0.255;
+
+              // Subtle secondary feather V-ridge inside main Kelvin cusp
+              float innerDist = abs(side) - armOffset * 0.72;
+              float innerBand = exp(-pow(innerDist / (0.013 * sc + bowBack * 0.009), 2.0)) * env * 0.55;
+              wakeGrad += armNormalDir * cos(echelonPhase * 1.18 + 1.2) * innerBand * 0.12;
+
+              // Crisp transverse stern wavelets strictly inside the V-wedge
+              if (back > 0.08 * sc && abs(side) < armOffset * 0.88) {
+                float transEnv = exp(-(back - 0.08 * sc) / (0.58 * sc))
+                  * (1.0 - smoothstep(0.55, 0.90, abs(side) / max(0.01, armOffset)));
+                float transSlope = cos(back * (50.0 / sc) - uTime * 2.9) * transEnv;
+                wakeGrad += fwd * transSlope * 0.092;
               }
             }
           }
         }
 
+        // Subtle circular basin meniscus curvature right along the inner rim wall (surface tension)
+        float rimDist = max(0.0, rimRadius - distFromCenter);
+        float meniscusMask = exp(-pow(rimDist / 0.14, 2.0));
+        vec2 radialOut = distFromCenter > 0.001 ? p / distFromCenter : vec2(0.0, 1.0);
+        vec2 meniscusGrad = -radialOut * meniscusMask * 0.12;
+
+        vec2 rippleN = vec2(
+          (nA.x * 0.036 + nB.x * 0.026 + capX) * openBayFactor,
+          (nA.y * 0.044 + nB.y * 0.032 + capZ) * openBayFactor
+        );
+
         vec3 N = normalize(vec3(
-          nA.x * 0.024 + nB.x * 0.018 + capX + wakeGrad.x,
+          rippleN.x + wakeGrad.x + meniscusGrad.x,
           1.0,
-          nA.y * 0.024 + nB.y * 0.018 + capZ + wakeGrad.y
+          rippleN.y + wakeGrad.y + meniscusGrad.y
         ));
 
         vec3 V = normalize(cameraPosition - vWorldPos);
@@ -427,8 +525,8 @@ export function createHarborWaterMaterial(
         vec3 keyL = normalize(uSoftboxKeyDir);
         float NdotV = clamp(dot(N, V_spec), 0.0, 1.0);
 
-        // Schlick Fresnel for polished dark smoked resin/water (F0 = 0.032)
-        float fresnel = fresnelSchlick(NdotV, 0.032);
+        // Schlick Fresnel for dark harbor water (F0 = 0.028)
+        float fresnel = fresnelSchlick(NdotV, 0.028);
 
         float waterShadow = min(
           sampleOrthographicShadowPCF(
@@ -447,16 +545,24 @@ export function createHarborWaterMaterial(
           )
         );
 
-        // Real-time Planar Reflection Pass (inverted skyscrapers, Convention Center & lamps)
+        // 3. Real-time Planar Reflection Pass with progressive capillary breakup & silhouette softening
         vec2 reflNdc = vReflClipPos.xy / max(0.0001, vReflClipPos.w);
         vec2 reflUv = reflNdc * 0.5 + 0.5;
-        vec2 rippleDistort = N.xz * vec2(0.055, 0.115);
+        float reflDepthFactor = mix(0.45, 2.35, smoothstep(0.0, 5.5, max(0.0, shoreDist)));
+        vec2 rippleDistort = (rippleN + wakeGrad * 0.45) * vec2(0.085, 0.185) * reflDepthFactor;
         vec2 sampleUv = clamp(reflUv + rippleDistort, vec2(0.002), vec2(0.998));
-        vec3 planarRefl = texture(uReflectMap, sampleUv).rgb;
 
-        // Studio IBL specular & sharp key softbox catch on Kelvin wakes + capillary crests
+        // Subtle capillary-spread 3-tap reflection softening stronger further down the reflection
+        float blurSpread = smoothstep(0.4, 5.5, max(0.0, shoreDist));
+        vec2 jitterStep = vec2(0.0022, 0.0046) * (0.25 + 1.35 * blurSpread);
+        vec3 reflCenter = texture(uReflectMap, sampleUv).rgb;
+        vec3 reflTapA = texture(uReflectMap, clamp(sampleUv + vec2(jitterStep.x, jitterStep.y) + rippleDistort * 0.25, vec2(0.002), vec2(0.998))).rgb;
+        vec3 reflTapB = texture(uReflectMap, clamp(sampleUv - vec2(jitterStep.x, jitterStep.y * 0.85) - rippleDistort * 0.20, vec2(0.002), vec2(0.998))).rgb;
+        vec3 planarRefl = mix(reflCenter, reflCenter * 0.50 + (reflTapA + reflTapB) * 0.25, blurSpread * 0.88);
+
+        // 4. Studio Cyclorama & Softbox Fresnel Reflections (#090B0E to #181E26) + Capillary & Kelvin Glints
         vec3 R = reflect(-V_spec, N);
-        float waterRoughness = 0.045;
+        float waterRoughness = mix(0.048, 0.088, blurSpread);
         vec3 iblStudio = sampleStudioIBL(
           uStudioIblMap,
           R,
@@ -467,51 +573,91 @@ export function createHarborWaterMaterial(
           uFillIntensity
         );
         vec3 H = normalize(keyL + V_spec);
-        vec3 H_overhead = normalize(normalize(vec3(-0.20, 0.90, 0.38)) + V_spec);
-        float wakeCrest = clamp(wakeCrestMask, 0.0, 1.0);
-        float wakeKeySpec = pow(max(dot(N, H), 0.0), 150.0) * uKeyIntensity * waterShadow * 1.45
-          + (pow(max(dot(N, H), 0.0), 28.0) * 0.22 + pow(max(dot(N, H_overhead), 0.0), 22.0) * 0.18)
-            * wakeCrest * uKeyIntensity * mix(0.45, 1.0, waterShadow);
+        vec3 H_overhead = normalize(normalize(vec3(-0.22, 0.88, 0.42)) + V_spec);
+        vec3 H_rim = normalize(normalize(vec3(-0.78, 0.42, 0.46)) + V_spec);
 
-        // Deep dark Beer-Lambert smoked water volume
-        float bayDepth = smoothstep(0.0, 2.2, max(0.0, shoreDist));
-        vec3 beerAbsorption = exp(-vec3(1.20, 1.02, 0.86) * bayDepth);
-        vec3 shallowSlate = vec3(0.0019, 0.0021, 0.0026) * beerAbsorption;
-        vec3 deepObsidian = vec3(0.0007, 0.0008, 0.0011);
-        vec3 waterVolume = mix(shallowSlate, deepObsidian, 0.72);
+        // Ambient studio cyclorama dome reflection (sRGB #090B0E -> #181E26 linear equivalent)
+        float grazingFactor = pow(1.0 - NdotV, 2.2);
+        vec3 cycloramaDeep = vec3(0.0028, 0.0034, 0.0044);     // ~#090B0E sRGB
+        vec3 cycloramaHorizon = vec3(0.0091, 0.0131, 0.0196);  // ~#181E26 sRGB
+        vec3 cycloramaRefl = mix(cycloramaDeep, cycloramaHorizon, clamp(0.18 + 0.82 * grazingFactor + R.y * 0.25, 0.0, 1.0));
 
-        // Crisp pinpoint specular reflections straight down into the rippled water below each esplanade lamp
+        // Broad overhead softbox sheen across the dark liquid surface (reveals capillary surface tension)
+        float softboxSheen = (pow(max(dot(N, H_overhead), 0.0), 14.0) * 0.026
+                            + pow(max(dot(N, H), 0.0), 28.0) * 0.020)
+                           * (0.35 + 0.65 * fresnel) * uKeyIntensity * mix(0.45, 1.0, waterShadow);
+
+        // Delicate micro-specular glints caught along capillary wave crests & steep Kelvin wakes
+        float capillaryCrest = clamp(length(rippleN) * 14.0, 0.0, 1.0);
+        float capillaryMicroGlint = pow(max(dot(N, H_overhead), 0.0), 72.0) * capillaryCrest * 0.042 * uKeyIntensity
+                                  + pow(max(dot(N, H_rim), 0.0), 110.0) * capillaryCrest * 0.032 * uRimIntensity;
+        float wakeStrength = clamp(length(wakeGrad) * 6.5, 0.0, 1.0);
+        float sharpKeyGlint = pow(max(dot(N, H), 0.0), 150.0) * uKeyIntensity * waterShadow * (0.28 + 1.55 * wakeStrength);
+        float wakeSoftGlint = pow(max(dot(N, H_overhead), 0.0), 42.0) * wakeStrength * 0.095 * uKeyIntensity * waterShadow;
+        float meniscusGlint = pow(max(dot(N, H), 0.0), 48.0) * meniscusMask * 0.105 * uKeyIntensity;
+
+        // 5. Deep dark smoked slate-harbor water volume (never collapses to dead #000000 black)
+        float bayDepth = smoothstep(0.0, 2.4, max(0.0, shoreDist));
+        vec3 beerAbsorption = exp(-vec3(0.92, 0.80, 0.68) * bayDepth);
+        vec3 shallowSlate = vec3(0.0052, 0.0060, 0.0074) * beerAbsorption;
+        vec3 deepHarbor = vec3(0.0029, 0.0035, 0.0046);
+        vec3 waterVolume = mix(shallowSlate, deepHarbor, 0.58) * (0.72 + 0.28 * uFillIntensity);
+
+        // 6. View-aligned vertical reflection shimmer trails directly below each esplanade lamppost
         float lampGlints = 0.0;
-        if (shoreDist > -0.10 && shoreDist < 1.65) {
-          float pressBoost = 1.0 + uPressDepth * 0.35;
+        if (shoreDist > -0.04 && shoreDist < 1.75) {
+          float pressBoost = 1.0 + uPressDepth * 0.30;
+          float waterMask = smoothstep(-0.02, 0.07, shoreDist);
           for (int i = 0; i < 32; i++) {
             if (i >= uLampCount) break;
             vec2 lp = uLamps[i];
-            float dx = (p.x + N.x * 0.085) - lp.x;
-            float dz = p.y - lp.y;
-            if (abs(dx) < 0.16 && dz > -0.02 && dz < 1.35) {
-              // Vertically-rippled pinpoint specular column directly below the lamp
-              float pin = exp(-pow(dx / 0.028, 2.0)) * exp(-max(0.0, dz) * 3.1);
-              float rippleSparkle = 0.45 + 0.55 * smoothstep(-0.015, 0.028, N.z);
-              lampGlints += pin * rippleSparkle * 0.48 * pressBoost;
+            vec2 dLamp = p - lp;
+            if (dot(dLamp, dLamp) < 2.25) {
+              vec2 toCam = cameraPosition.xz - lp;
+              float camLen = max(0.001, length(toCam));
+              vec2 viewAxis = toCam / camLen;
+              vec2 perpAxis = vec2(-viewAxis.y, viewAxis.x);
+
+              // Project onto camera-vertical column directly below each lamp post
+              float along = dot(dLamp, viewAxis);
+              float across = dot(dLamp, perpAxis);
+
+              if (along > 0.01 && along < 1.25 && abs(across) < 0.14) {
+                float rippleHorizShift = dot(N.xz, perpAxis) * (0.045 + along * 0.035);
+                float sigmaAcross = 0.018 + along * 0.012;
+                float colMask = exp(-pow((across + rippleHorizShift) / sigmaAcross, 2.0));
+                float vertEnvelope = smoothstep(0.0, 0.07, along) * exp(-along * 2.35);
+
+                // Break up the vertical trail naturally into horizontal water-ripple sparkles
+                float slopeAlong = dot(N.xz, viewAxis);
+                float waveSpark = smoothstep(-0.014, 0.036, slopeAlong + capZ * 0.45);
+                float horizBands = 0.25 + 0.75 * smoothstep(
+                  -0.15,
+                  0.65,
+                  sin(along * 48.0 + nB.y * 4.8 + nA.x * 2.2 - uTime * 1.9)
+                );
+                lampGlints += colMask * vertEnvelope * waveSpark * horizBands * 0.32 * pressBoost * waterMask;
+              }
             }
           }
         }
 
-        float shoreCreviceAo = mix(0.24 - uPressDepth * 0.12, 1.0, pow(smoothstep(-0.04, 0.32, shoreDist), 1.0 + uPressDepth * 0.55));
-        float rimDist = uBasinRadius - distFromCenter;
-        float basinEdgeFade = smoothstep(0.05, 0.36, rimDist);
+        float shoreCreviceAo = mix(0.24 - uPressDepth * 0.12, 1.0, pow(smoothstep(-0.04, 0.36, shoreDist), 1.0 + uPressDepth * 0.55));
+        float basinEdgeFade = smoothstep(0.0, 0.045, rimDist);
 
-        // Combine deep absorption + Fresnel planar skyline reflection + crisp IBL & wake highlights
-        float reflMask = (0.04 + 0.96 * fresnel) * uReflectivity * mix(0.42, 1.0, waterShadow);
-        vec3 studioGloss = iblStudio * (0.02 + 0.98 * fresnel) * 0.0024 * uReflectivity * mix(0.35, 1.0, waterShadow);
+        // Combine deep harbor volume + ambient cyclorama Fresnel + planar skyline reflection + crisp micro-glints
+        float reflMask = (0.06 + 0.94 * fresnel) * uReflectivity * mix(0.44, 1.0, waterShadow) * boatContactAo;
+        vec3 studioGloss = iblStudio * (0.08 + 0.92 * fresnel) * 0.030 * uReflectivity * mix(0.45, 1.0, waterShadow);
+        vec3 ambientCyclorama = cycloramaRefl * (0.38 + 0.62 * fresnel) * shoreCreviceAo * mix(0.62, 1.0, waterShadow);
 
-        vec3 finalColor = waterVolume * shoreCreviceAo * mix(0.45, 1.0, waterShadow)
-          + planarRefl * reflMask * 1.18
+        vec3 finalColor = waterVolume * shoreCreviceAo * boatContactAo * mix(0.55, 1.0, waterShadow)
+          + ambientCyclorama
+          + planarRefl * reflMask * 1.24
           + studioGloss
-          + vec3(0.90, 0.92, 0.96) * (wakeKeySpec + lampGlints * uReflectivity);
+          + vec3(0.88, 0.92, 0.97) * (softboxSheen + capillaryMicroGlint + wakeSoftGlint + sharpKeyGlint + meniscusGlint)
+          + STUDIO_WARM_POOL_3000K * (lampGlints * uReflectivity * 1.15);
 
-        fragColor = vec4(finalColor, basinEdgeFade * 0.97);
+        fragColor = vec4(finalColor, basinEdgeFade * 0.985);
       }
     `,
   });
@@ -531,7 +677,20 @@ export function createLandmassObsidianMaterial(
   microImperfectionMap: THREE.Texture,
   studioIblMap: THREE.Texture,
   basinRadius: number,
+  seawallLampXZ: Array<{ x: number; z: number }> = [],
+  heroLobbyZones: Array<{ x: number; z: number; radius: number; strength: number }> = [],
 ): THREE.ShaderMaterial {
+  const paddedLamps: THREE.Vector2[] = [];
+  for (let i = 0; i < 32; i++) {
+    const l = seawallLampXZ[i];
+    paddedLamps.push(l ? new THREE.Vector2(l.x, l.z) : new THREE.Vector2(999, 999));
+  }
+  const paddedLobbies: THREE.Vector4[] = [];
+  for (let i = 0; i < 12; i++) {
+    const h = heroLobbyZones[i];
+    paddedLobbies.push(h ? new THREE.Vector4(h.x, h.z, h.radius, h.strength) : new THREE.Vector4(999, 999, 0.1, 0));
+  }
+
   return new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     uniforms: {
@@ -551,6 +710,10 @@ export function createLandmassObsidianMaterial(
       uPressDepth: { value: 0.0 },
       uTiltVec: { value: new THREE.Vector2(0, 0) },
       uVelocity: { value: new THREE.Vector2(0, 0) },
+      uLamps: { value: paddedLamps },
+      uLampCount: { value: Math.min(32, seawallLampXZ.length) },
+      uHeroLobbies: { value: paddedLobbies },
+      uHeroLobbyCount: { value: Math.min(12, heroLobbyZones.length) },
     },
     vertexShader: /* glsl */ `
       out vec3 vWorldPos;
@@ -580,6 +743,10 @@ export function createLandmassObsidianMaterial(
       uniform float uPressDepth;
       uniform vec2 uTiltVec;
       uniform vec2 uVelocity;
+      uniform vec2 uLamps[32];
+      uniform int uLampCount;
+      uniform vec4 uHeroLobbies[12];
+      uniform int uHeroLobbyCount;
 
       in vec3 vWorldPos;
       in vec3 vWorldNormal;
@@ -631,21 +798,24 @@ export function createLandmassObsidianMaterial(
         );
         float castShadow = uHasShadowMap > 0.5 ? pcfShadow : heightShadow;
 
-        // Rotated San Diego downtown street grid
+        // Rotated San Diego downtown street grid, cleanly masked before seawall coping & basin rim
         float c = cos(0.22);
         float s = sin(0.22);
         vec2 streetUv = vec2(
           vWorldPos.x * c - vWorldPos.z * s,
           vWorldPos.x * s + vWorldPos.z * c
         );
+        float seawallCurveZ = 2.6 + 2.35 * cos(vWorldPos.x * 0.24 + 0.35) - 0.14 * vWorldPos.x;
+        float seawallMarginMask = smoothstep(0.22, 0.56, seawallCurveZ - vWorldPos.z);
+        float perimeterMask = smoothstep(uBasinRadius - 0.28, uBasinRadius - 0.62, length(vWorldPos.xz));
         float streetGrid = max(
           sdfLine(streetUv.x, 0.606, 0.024),
           sdfLine(streetUv.y, 0.606, 0.024)
-        ) * smoothstep(0.5, 0.95, baseN.y);
+        ) * smoothstep(0.5, 0.95, baseN.y) * seawallMarginMask * perimeterMask;
 
         // 3:1 key-to-fill dead-matte diffuse with subtle warm key / cool obsidian fill temperature
-        vec3 keyTerm = STUDIO_KEY_WARM * max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity * 0.96;
-        vec3 fillTerm = STUDIO_FILL_COOL * (0.16 * uFillIntensity + wrapDiffuse(N, fillL, 0.35) * uFillIntensity * 0.38);
+        vec3 keyTerm = STUDIO_KEY_WARM * max(dot(N, keyL), 0.0) * castShadow * uKeyIntensity * 1.04;
+        vec3 fillTerm = STUDIO_FILL_COOL * (0.14 * uFillIntensity + wrapDiffuse(N, fillL, 0.35) * uFillIntensity * 0.34);
         vec3 studioBounce = sampleStudioIBL(
           uStudioIblMap,
           N,
@@ -672,9 +842,31 @@ export function createLandmassObsidianMaterial(
           (STUDIO_FILL_COOL * 0.24 * uFillIntensity + STUDIO_KEY_WARM * curbKey * 1.15) *
           mix(0.45, 1.0, aoSample.g);
 
-        // Subtle promenade streetlight bounce onto wet/matte Embarcadero concrete
-        float seawallApproxDist = abs(vWorldPos.z - (2.6 + 2.35 * cos(vWorldPos.x * 0.24 + 0.35) - 0.14 * vWorldPos.x));
-        float promenadeSpill = exp(-seawallApproxDist * 1.6) * (0.14 + uPressDepth * 0.65 + length(uVelocity) * 0.18);
+        // Subtle localized warm champagne-amber pools (2900K-3000K) beneath curved waterfront esplanade lamps
+        float lampPoolAccum = 0.0;
+        for (int i = 0; i < 32; i++) {
+          if (i >= uLampCount) break;
+          vec2 dLamp = vWorldPos.xz - uLamps[i];
+          float d2 = dot(dLamp, dLamp);
+          if (d2 < 0.36) {
+            lampPoolAccum += exp(-d2 / (0.18 * 0.18));
+          }
+        }
+        float lampPoolMask = smoothstep(-0.18, 0.08, seawallCurveZ - vWorldPos.z) * smoothstep(0.35, 0.90, baseN.y);
+        float esplanadeWarmPool = min(1.15, lampPoolAccum) * lampPoolMask * (0.48 + uPressDepth * 0.20);
+
+        // Soft warm champagne glow spilling gently from ground-floor hero tower lobbies & colonnades
+        float lobbySpillAccum = 0.0;
+        for (int i = 0; i < 12; i++) {
+          if (i >= uHeroLobbyCount) break;
+          vec4 hb = uHeroLobbies[i];
+          vec2 dLobby = vWorldPos.xz - hb.xy;
+          if (dot(dLobby, dLobby) < 4.5) {
+            float distEdge = max(0.0, length(dLobby) - hb.z);
+            lobbySpillAccum += exp(-distEdge * 3.1) * smoothstep(1.20, 0.0, distEdge) * hb.w;
+          }
+        }
+        float lobbyWarmSpill = min(1.0, lobbySpillAccum) * smoothstep(0.40, 0.95, baseN.y) * mix(0.28, 1.0, tightCreviceAo);
 
         vec3 streetHighlight =
           vec3(0.016, 0.017, 0.020) *
@@ -685,7 +877,7 @@ export function createLandmassObsidianMaterial(
         vec3 finalRgb = slateBase
           + streetHighlight
           + seawallConcrete
-          + vec3(0.016, 0.0155, 0.015) * promenadeSpill * mix(0.4, 1.0, aoSample.g);
+          + STUDIO_WARM_POOL_3000K * (esplanadeWarmPool * 0.095 + lobbyWarmSpill * 0.088) * mix(0.45, 1.0, aoSample.g);
         finalRgb = applyCanyonAtmosphere(finalRgb, vWorldPos, cameraPosition, aoSample.g);
         fragColor = vec4(finalRgb, 1.0);
       }
@@ -696,6 +888,7 @@ export function createLandmassObsidianMaterial(
 export interface MatteSlateOptions {
   baseColor?: number;
   masonryWindows?: boolean;
+  seawallLampXZ?: Array<{ x: number; z: number }>;
 }
 
 /**
@@ -715,6 +908,12 @@ export function createMatteSlateMaterial(
     typeof optionsOrColor === 'number' ? { baseColor: optionsOrColor } : optionsOrColor;
   const baseColor = opts.baseColor ?? 0x1e2025;
   const masonryWindows = opts.masonryWindows ?? false;
+  const seawallLampXZ = opts.seawallLampXZ ?? [];
+  const paddedLamps: THREE.Vector2[] = [];
+  for (let i = 0; i < 32; i++) {
+    const l = seawallLampXZ[i];
+    paddedLamps.push(l ? new THREE.Vector2(l.x, l.z) : new THREE.Vector2(999, 999));
+  }
 
   return new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -738,6 +937,8 @@ export function createMatteSlateMaterial(
       uTiltVec: { value: new THREE.Vector2(0, 0) },
       uVelocity: { value: new THREE.Vector2(0, 0) },
       uIsReflectPass: { value: 0.0 },
+      uLamps: { value: paddedLamps },
+      uLampCount: { value: Math.min(32, seawallLampXZ.length) },
     },
     vertexShader: /* glsl */ `
       out vec3 vWorldPos;
@@ -778,6 +979,8 @@ export function createMatteSlateMaterial(
       uniform vec2 uTiltVec;
       uniform vec2 uVelocity;
       uniform float uIsReflectPass;
+      uniform vec2 uLamps[32];
+      uniform int uLampCount;
 
       in vec3 vWorldPos;
       in vec3 vWorldNormal;
@@ -869,6 +1072,34 @@ export function createMatteSlateMaterial(
         float faceKeyVis = smoothstep(-0.08, 0.25, dot(baseN, keyL));
         float bevelKey = pow(max(dot(chamferRes.xyz, keyL), 0.0), 1.8) * castShadow * faceKeyVis * chamferRes.w;
         color += STUDIO_KEY_WARM * vec3(0.016, 0.017, 0.019) * bevelKey * uKeyIntensity;
+
+        // Razor-thin platinum edge rim glint along sharp vertical corners, setbacks & parapet lips
+        vec3 V_slate = normalize(cameraPosition - vWorldPos);
+        vec3 platinumRim = computePlatinumEdgeGlint(
+          baseN,
+          chamferRes.xyz,
+          V_slate,
+          keyL,
+          chamferRes.w,
+          uRimIntensity,
+          uKeyIntensity
+        );
+        color += platinumRim * 0.26 * baseAo;
+
+        // Faint 2950K warm champagne pools cast directly onto seawall coping promenade beneath lamps
+        if (vWorldPos.y < 0.24 && uLampCount > 0) {
+          float copingPool = 0.0;
+          for (int i = 0; i < 32; i++) {
+            if (i >= uLampCount) break;
+            vec2 dLamp = vWorldPos.xz - uLamps[i];
+            float d2 = dot(dLamp, dLamp);
+            if (d2 < 0.32) {
+              copingPool += exp(-d2 / (0.16 * 0.16));
+            }
+          }
+          color += STUDIO_WARM_POOL_3000K * min(1.0, copingPool) * 0.052 * smoothstep(0.10, 0.90, baseN.y);
+        }
+
         color = applyCanyonAtmosphere(color, vWorldPos, cameraPosition, spatialAo.g);
 
         fragColor = vec4(color, 1.0);
@@ -884,16 +1115,17 @@ export interface SdfGlassOptions {
   edgeLuminance?: number;
   isHero?: boolean;
   allowSideChamfers?: boolean;
+  interiorMode?: 'tower' | 'lobby' | 'terminal-arch';
 }
 
 /**
  * WebGL2 GLSL3 Architectural Curtain-Wall Glass Shader (Museum Scale-Model Realism):
- * - Smoked dark architectural glass with crisp horizontal spandrel bands & vertical mullions
- * - Per-pane deterministic normal micro-jitter (±0.03) so adjacent glass panes catch the
- *   studio overhead softbox at slightly different angles (zero salt-and-pepper noise!)
- * - Sparse, clean softly glowing horizontal interior floor bands
- * - Strong 3:1 key-to-fill studio shading + real raymarched cast shadows onto neighboring facades & roofs
- * - Dead-matte dark slate concrete rooftops (roughness ~0.88, zero glossy glare)
+ * - Smoked dark high-IOR architectural glass with crisp horizontal spandrel bands & vertical mullions
+ * - Clustered contiguous office suites (3–8 adjacent bays), occasional wrapped corner offices,
+ *   warm ground-floor hero lobbies, and soft vaulted terminal bays
+ * - True parallax depth behind dark facade mullions/spandrels with ceiling-to-floor luminance cascade
+ *   and Fresnel glazing attenuation at oblique viewing angles
+ * - Restrained photographic alabaster / champagne-ivory / sparse cool daylight interior palette
  */
 export function createSdfGlassMaterial(
   grainTexture: THREE.Texture,
@@ -910,7 +1142,9 @@ export function createSdfGlassMaterial(
     edgeLuminance = 0.85,
     isHero = true,
     allowSideChamfers = true,
+    interiorMode = 'tower',
   } = options;
+  const interiorModeCode = interiorMode === 'lobby' ? 1.0 : interiorMode === 'terminal-arch' ? 2.0 : 0.0;
 
   return new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -934,6 +1168,7 @@ export function createSdfGlassMaterial(
       uEdgeLuminance: { value: edgeLuminance },
       uIsHero: { value: isHero ? 1.0 : 0.48 },
       uAllowSideChamfers: { value: allowSideChamfers ? 1.0 : 0.0 },
+      uInteriorMode: { value: interiorModeCode },
       uHighlightBoost: { value: 0.0 },
       uPressDepth: { value: 0.0 },
       uTiltVec: { value: new THREE.Vector2(0, 0) },
@@ -944,6 +1179,7 @@ export function createSdfGlassMaterial(
       out vec3 vWorldPos;
       out vec3 vWorldNormal;
       out vec3 vLocalPos;
+      out vec3 vBuildingOrigin;
       out vec2 vUv;
 
       void main() {
@@ -951,14 +1187,17 @@ export function createSdfGlassMaterial(
         vLocalPos = position;
 
         vec4 localPosition = vec4(position, 1.0);
+        vec4 originLocal = vec4(0.0, 0.0, 0.0, 1.0);
         vec3 localNormal = normal;
         #ifdef USE_INSTANCING
           localPosition = instanceMatrix * localPosition;
+          originLocal = instanceMatrix * originLocal;
           localNormal = mat3(instanceMatrix) * localNormal;
         #endif
 
         vec4 worldPosition = modelMatrix * localPosition;
         vWorldPos = worldPosition.xyz;
+        vBuildingOrigin = (modelMatrix * originLocal).xyz;
         vWorldNormal = normalize(mat3(modelMatrix) * localNormal);
 
         gl_Position = projectionMatrix * viewMatrix * worldPosition;
@@ -984,6 +1223,7 @@ export function createSdfGlassMaterial(
       uniform float uEdgeLuminance;
       uniform float uIsHero;
       uniform float uAllowSideChamfers;
+      uniform float uInteriorMode;
       uniform float uHighlightBoost;
       uniform float uPressDepth;
       uniform vec2 uTiltVec;
@@ -993,6 +1233,7 @@ export function createSdfGlassMaterial(
       in vec3 vWorldPos;
       in vec3 vWorldNormal;
       in vec3 vLocalPos;
+      in vec3 vBuildingOrigin;
       in vec2 vUv;
 
       out vec4 fragColor;
@@ -1074,28 +1315,34 @@ export function createSdfGlassMaterial(
         float mullionFreq = uMullionDensity * 0.44;
         float floorFreq = uFloorDensity * 0.42;
 
-        // Crisp horizontal spandrel bands (~23% of floor height) & vertical mullions
+        // Crisp horizontal spandrel bands & prominent dark vertical mullions IN FRONT of lit interiors
         float floorScaled = vWorldPos.y * floorFreq;
         float floorPhase = fract(floorScaled);
         float fwFloor = max(fwidth(floorScaled), 0.002);
-        float spandrelMask = (1.0 - smoothstep(0.22 - fwFloor, 0.22 + fwFloor, floorPhase)) * (1.0 - isRoof);
-        float vMullion = sdfGridLine(wallX, mullionFreq, 0.024) * (1.0 - isRoof);
+        float spandrelRatio = uInteriorMode > 1.5 ? 0.05 : (uInteriorMode > 0.5 ? 0.12 : 0.25);
+        float mullionThick = uInteriorMode > 1.5 ? 0.036 : (uInteriorMode > 0.5 ? 0.050 : 0.048);
+        float spandrelMask = (1.0 - smoothstep(spandrelRatio - fwFloor, spandrelRatio + fwFloor, floorPhase)) * (1.0 - isRoof);
+        if (uInteriorMode > 1.5) {
+          spandrelMask = 0.0;
+        }
+        float vMullion = sdfGridLine(wallX, mullionFreq, mullionThick) * (1.0 - isRoof);
         float frameMask = clamp(max(spandrelMask, vMullion), 0.0, 1.0);
 
-        // Subtle per-pane normal micro-tilt (±0.020) inside glass vision bays
+        // Subtle per-pane normal micro-tilt (±0.022) inside glass vision bays
         vec2 paneCell = floor(vec2(wallX * mullionFreq + 0.5, floorScaled));
-        float jx = (hash21(paneCell) - 0.5) * 0.040;
-        float jy = (hash21(paneCell + vec2(31.7, 17.3)) - 0.5) * 0.040;
+        float jx = (hash21(paneCell) - 0.5) * 0.042;
+        float jy = (hash21(paneCell + vec2(31.7, 17.3)) - 0.5) * 0.042;
         vec3 paneN = normalize(N + (wallT * jx + vec3(0.0, 1.0, 0.0) * jy) * (1.0 - frameMask) * (1.0 - isRoof));
 
         float NdotV = clamp(dot(paneN, V), 0.0, 1.0);
-        float fresnel = fresnelSchlick(NdotV, 0.072);
+        // High-IOR glossy architectural curtain-wall glass (F0 = 0.095)
+        float fresnel = fresnelSchlick(NdotV, 0.095);
 
-        // Glass roughness ~0.062 with subtle micro-variance vs matte dark anodized spandrels (~0.64)
+        // Crisp high-gloss outer glass (~0.036) vs matte dark anodized mullions/spandrels (~0.68)
         float glassRoughness = clamp(
-          mix(0.062 + (micro.r - 0.5) * 0.020, 0.64, frameMask),
-          0.04,
-          0.68
+          mix(0.036 + (micro.r - 0.5) * 0.016, 0.68, frameMask),
+          0.026,
+          0.70
         );
 
         vec3 R_g = reflect(-V, paneN);
@@ -1109,19 +1356,19 @@ export function createSdfGlassMaterial(
         float iblB = sampleStudioIBL(uStudioIblMap, dirB, glassRoughness, keyL, uKeyIntensity, uRimIntensity, uFillIntensity).b;
         vec3 studioIbl = vec3(iblR, iblG, iblB);
 
-        // 3:1 key-to-fill lighting across vertical tower faces (warm key vs cool obsidian fill)
+        // Raking key-to-fill contrast across vertical tower faces (stronger cast shadow separation)
         float keyFace = max(dot(paneN, keyL), 0.0) * castShadow;
-        float fillFace = wrapDiffuse(paneN, fillL, 0.22) * uFillIntensity * 0.24;
-        vec3 keyDiffuseRgb = STUDIO_FILL_COOL * (0.12 * uFillIntensity + fillFace)
-          + STUDIO_KEY_WARM * (keyFace * uKeyIntensity * 0.96);
+        float fillFace = wrapDiffuse(paneN, fillL, 0.22) * uFillIntensity * 0.20;
+        vec3 keyDiffuseRgb = STUDIO_FILL_COOL * (0.10 * uFillIntensity + fillFace)
+          + STUDIO_KEY_WARM * (keyFace * uKeyIntensity * 1.12);
 
-        // Beer-Lambert smoked glass depth absorption (subtle cool obsidian glass body)
-        float opticalThickness = 0.52 / max(0.26, NdotV);
+        // Beer-Lambert smoked glass depth absorption
+        float opticalThickness = 0.56 / max(0.24, NdotV);
         vec3 beerLambert = exp(-vec3(0.54, 0.49, 0.42) * opticalThickness);
 
-        // Inner Depth Layer: GLSL Tangent-Space Interior Parallax (recessed 3D floor slabs + office bays)
-        float bayU = fract(wallX * mullionFreq * 0.5 + 0.25);
-        float bayV = clamp((floorPhase - 0.22) / 0.78, 0.001, 0.999);
+        // Inner Depth Layer: GLSL Tangent-Space Interior Parallax (recessed suites behind crisp dark mullions)
+        float bayU = fract(wallX * mullionFreq + 0.5);
+        float bayV = clamp((floorPhase - spandrelRatio) / max(0.2, 1.0 - spandrelRatio), 0.001, 0.999);
         float vDotN = max(0.22, abs(dot(V_raw, baseN)));
         vec2 rayT = vec2(-dot(V_raw, wallT), -V_raw.y) / vDotN;
 
@@ -1131,64 +1378,163 @@ export function createSdfGlassMaterial(
         float tCol = (rayT.x > 0.0001)
           ? (1.0 - bayU) / rayT.x
           : ((rayT.x < -0.0001) ? bayU / (-rayT.x) : 99.0);
-        float tBack = 0.46;
+        float tBack = 0.54;
         float tHit = min(tBack, min(tSlab, tCol));
         vec2 hitUv = clamp(vec2(bayU, bayV) + rayT * tHit, vec2(0.0), vec2(1.0));
         float hitSlab = step(tSlab, min(tCol, tBack));
         float hitCol = step(tCol, min(tSlab, tBack)) * (1.0 - hitSlab);
 
-        float interiorBoxAo = (0.45 + 0.55 * smoothstep(0.0, 0.22, hitUv.y) * smoothstep(1.0, 0.76, hitUv.y))
-          * (0.55 + 0.45 * smoothstep(0.0, 0.16, hitUv.x) * smoothstep(1.0, 0.84, hitUv.x));
+        // Deeper recessed shadow inside mullion reveals & upper/lower slab soffits
+        float interiorBoxAo = (0.34 + 0.66 * smoothstep(0.0, 0.16, hitUv.y) * smoothstep(1.0, 0.78, hitUv.y))
+          * (0.38 + 0.62 * smoothstep(0.0, 0.14, hitUv.x) * smoothstep(1.0, 0.86, hitUv.x));
 
-        // Sparse, subtle softly illuminated warm-ivory office bays recessed behind glass
-        float floorRand = hash21(vec2(paneCell.y, 13.7));
-        float wingBucket = floor(wallX * mullionFreq * 0.24);
-        float wingRand = hash21(vec2(wingBucket, paneCell.y + 7.1));
-        float occupiedBand = step(0.83, floorRand) * smoothstep(0.32, 0.68, wingRand);
-        float backWallMask = (1.0 - hitSlab) * (1.0 - hitCol * 0.65);
-        float interiorDepthShade = mix(0.35, 1.0, backWallMask) * interiorBoxAo;
+        // 1. Clustered Architectural Suite Occupancy (no noisy checkerboard pixels)
+        vec2 bKey = floor(vBuildingOrigin.xz * 2.5 + vec2(0.5));
+        float bSeed = hash21(bKey);
+        float floorIdx = paneCell.y;
+        float floorRand = hash21(vec2(floorIdx, bSeed * 97.3 + 13.7));
 
-        float bayGlowProfile = smoothstep(0.08, 0.35, hitUv.y) * (1.0 - smoothstep(0.75, 0.98, hitUv.y));
-        float interiorLum = occupiedBand * bayGlowProfile * (1.0 - frameMask) * (1.0 - isRoof) * (0.068 + 0.056 * uIsHero);
-        vec3 slabInteriorBase = vec3(0.006, 0.0065, 0.0075) * interiorDepthShade * (0.40 + 0.60 * keyFace);
-        vec3 interiorGlow = STUDIO_INTERIOR_IVORY * interiorLum * backWallMask * interiorBoxAo * (1.0 + uPressDepth * 0.35);
-        vec3 innerParallaxLayer = (slabInteriorBase + interiorGlow) * beerLambert;
+        // Group bays into macro clusters of 10 bays and ignite contiguous suites of 3–8 adjacent bays
+        float macroIdx = floor(paneCell.x / 10.0);
+        float localBay = paneCell.x - macroIdx * 10.0;
+        float suiteSeed = hash21(vec2(macroIdx * 11.3 + bSeed * 41.0, floorIdx + 7.1));
+        float suiteStart = floor(hash21(vec2(suiteSeed, floorIdx * 3.1)) * 4.0);       // 0..3
+        float suiteLen = 3.0 + floor(hash21(vec2(floorIdx, suiteSeed * 19.7)) * 5.6); // 3..8 contiguous bays
 
-        // Smoked outer glass body vs matte dark anodized spandrel/mullion strips
-        vec3 glassBody = uBaseColor * beerLambert * (vec3(0.45) + 0.90 * keyDiffuseRgb) + innerParallaxLayer;
-        vec3 spandrelBody = vec3(0.011, 0.012, 0.014) * (vec3(0.28) + 1.18 * keyDiffuseRgb);
+        float floorActive = step(0.56, floorRand);
+        float suiteActive = step(0.58, suiteSeed);
+        float inSuiteRun = step(suiteStart, localBay) * step(localBay, suiteStart + suiteLen - 0.5);
+        // Subtle 1-bay internal suite partition / blind variation (only ~7% dim break inside long runs)
+        float partitionDim = mix(0.84, 1.0, hash21(vec2(paneCell.x, floorIdx * 5.3 + suiteSeed)));
+        float blindMask = step(0.07, hash21(paneCell + vec2(17.9, 61.3)));
+        float suiteMask = floorActive * suiteActive * inSuiteRun * partitionDim * blindMask;
+
+        // Occasional lit corner office wrapping cleanly across adjacent perpendicular walls
+        vec2 relXZ = vWorldPos.xz - vBuildingOrigin.xz;
+        float relLen = length(relXZ);
+        vec2 relDir = relLen > 0.02 ? (relXZ / relLen) : horizNormal;
+        float cornerPick = floor(hash21(vec2(floorIdx * 7.3, bSeed * 53.0)) * 4.0);
+        float cornerAng = (cornerPick * 0.5 + 0.25) * PI + 0.22;
+        vec2 cornerDir = vec2(cos(cornerAng), sin(cornerAng));
+        float cornerWindow = smoothstep(0.82, 0.90, dot(relDir, cornerDir)) * step(0.84, hash21(vec2(floorIdx + 3.7, bSeed * 29.0)));
+
+        // Ground-floor warm lobby zone on hero towers & inset podium colonnade
+        float heroBaseZone = smoothstep(0.95, 0.58, vWorldPos.y) * smoothstep(0.45, 0.88, uIsHero);
+        float lobbyRun = step(0.28, hash21(vec2(floor(paneCell.x / 4.0), bSeed * 19.0)));
+
+        float modeTower = clamp(max(suiteMask, cornerWindow), 0.0, 1.0);
+        if (heroBaseZone > 0.01) {
+          modeTower = max(modeTower, heroBaseZone * lobbyRun * 0.92);
+        }
+
+        // Dedicated inset Lobby Mode (hero podium colonnade) & Vaulted Terminal Arch Mode
+        float modeLobby = (0.76 + 0.22 * hash21(vec2(floor(paneCell.x / 3.0), bSeed * 31.0)))
+          * smoothstep(0.06, 0.36, vWorldPos.y);
+        float archH = clamp((vWorldPos.y - 0.96) / 0.76, 0.0, 1.0);
+        float archVaultGrad = smoothstep(0.0, 0.24, archH) * smoothstep(1.02, 0.28, archH);
+        float modeTerminal = (0.74 + 0.24 * hash21(vec2(floor(vWorldPos.x * 1.1), floorIdx))) * archVaultGrad;
+
+        float occupancy = uInteriorMode > 1.5
+          ? modeTerminal
+          : (uInteriorMode > 0.5 ? modeLobby : modeTower);
+
+        // 2. True Recessed Parallax + Ceiling-to-Floor Brightness Cascade
+        float backWallMask = (1.0 - hitSlab) * (1.0 - hitCol * 0.86);
+        float interiorDepthShade = mix(0.24, 1.0, backWallMask) * interiorBoxAo;
+
+        // Brighter near the interior ceiling (hitUv.y -> 0.88), softer downward toward floor/desk
+        float ceilingCascade = mix(0.28, 1.0, smoothstep(0.06, 0.86, hitUv.y));
+        float trofferHighlight = 1.0 + 0.32 * exp(-pow((hitUv.y - 0.82) / 0.14, 2.0));
+        float sillSoffitClip = smoothstep(0.03, 0.14, hitUv.y) * smoothstep(0.98, 0.89, hitUv.y)
+          * smoothstep(0.04, 0.16, hitUv.x) * smoothstep(0.96, 0.84, hitUv.x);
+        float bayGlowProfile = uInteriorMode > 1.5
+          ? mix(0.70, 1.0, ceilingCascade) * smoothstep(0.02, 0.12, hitUv.x) * smoothstep(0.98, 0.88, hitUv.x)
+          : ceilingCascade * trofferHighlight * sillSoffitClip;
+
+        // 3. Restrained Luxury Palette (warm champagne-ivory + sparse daylight + 2950K lobbies & vaulted bays)
+        float tempRoll = hash21(vec2(suiteSeed * 31.7, floorIdx + 2.3));
+        vec3 baseSuiteTint = mix(STUDIO_INTERIOR_ALABASTER, STUDIO_INTERIOR_CHAMPAGNE, smoothstep(0.10, 0.68, tempRoll));
+        float isCoolDaylight = step(0.86, tempRoll) * (1.0 - heroBaseZone);
+        vec3 roomTint = mix(baseSuiteTint, STUDIO_INTERIOR_DAYLIGHT, isCoolDaylight);
+        if (uInteriorMode > 0.5 || heroBaseZone > 0.2) {
+          roomTint = mix(roomTint, STUDIO_INTERIOR_LOBBY, max(heroBaseZone, step(0.5, uInteriorMode)) * 0.94);
+        }
+
+        // Fresnel glazing attenuation: oblique faces dim cleanly under dark glossy outer glass
+        float glassTransmission = (1.0 - fresnel) * smoothstep(0.06, 0.38, NdotV);
+        float suiteLuminance = 0.58 + 0.50 * hash21(vec2(suiteSeed * 13.0, floorIdx * 7.0));
+        float heroScale = uInteriorMode > 1.5 ? 1.28 : (uInteriorMode > 0.5 ? 1.18 : (0.68 + 0.58 * uIsHero));
+        float reflectShimmer = mix(1.0, 1.52, uIsReflectPass);
+
+        float interiorLum = occupancy * bayGlowProfile
+          * (1.0 - frameMask) * (1.0 - isRoof)
+          * suiteLuminance * heroScale * reflectShimmer;
+
+        vec3 slabInteriorBase = vec3(0.0038, 0.0042, 0.0050) * interiorDepthShade * (0.24 + 0.76 * keyFace);
+        vec3 interiorGlow = roomTint * interiorLum * backWallMask * interiorBoxAo * glassTransmission * (1.0 + uPressDepth * 0.25);
+        // Preserve crisp neutral gallery white / soft platinum luminance inside recessed lobbies & arches
+        vec3 tintedAbsorption = mix(beerLambert, vec3(0.858, 0.866, 0.880), step(0.5, uInteriorMode) * 0.65);
+        vec3 innerParallaxLayer = slabInteriorBase * beerLambert + interiorGlow * tintedAbsorption;
+
+        // Pitch-dark smoked outer glass body vs matte dark anodized spandrel/mullion strips IN FRONT
+        vec3 glassBody = uBaseColor * beerLambert * (vec3(0.08) + 0.96 * keyDiffuseRgb) + innerParallaxLayer;
+        vec3 spandrelBody = vec3(0.0068, 0.0074, 0.0090) * (vec3(0.14) + 1.18 * keyDiffuseRgb);
         vec3 facadeBase = mix(glassBody, spandrelBody, frameMask);
 
-        // Outer Glass Layer: Smooth glossy Fresnel + vertical studio strip-softbox gradient sweep (brighter upper faces fading darker toward street)
-        float heightSheen = smoothstep(0.45, 7.8, vWorldPos.y);
-        float faceSoftboxAlign = smoothstep(-0.18, 0.72, dot(paneN.xz, normalize(keyL.xz)));
-        float stripSoftbox = pow(clamp(dot(R_g, normalize(vec3(keyL.x * 0.62, 0.72, keyL.z * 0.62))), 0.0, 1.0), 3.4);
-        vec3 upperStripSweep = STUDIO_KEY_WARM
-          * (0.035 + 0.140 * heightSheen)
-          * (0.30 + 0.70 * faceSoftboxAlign)
-          * (0.35 + 0.65 * stripSoftbox)
-          * (0.28 + 0.72 * fresnel)
-          * mix(0.22, 1.0, castShadow)
-          * (1.0 - frameMask * 0.85)
-          * uKeyIntensity;
+        // Outer Glass Layer: Dark Glossy Smoked Glass with Narrow, Sleek Vertical Softbox Streaks Along Edges
+        float heightSheen = smoothstep(0.50, 7.6, vWorldPos.y);
+        vec3 stripDirA = normalize(vec3(keyL.x * 0.78, 0.32, keyL.z * 0.78));
+        vec3 stripDirB = normalize(vec3(0.76, 0.34, -0.32));
+        vec3 R_vert = normalize(vec3(R_g.x, R_g.y * 0.22, R_g.z));
+        float narrowStreakA = pow(max(0.0, dot(R_vert, stripDirA)), 26.0);
+        float narrowStreakB = pow(max(0.0, dot(R_vert, stripDirB)), 34.0) * 0.65;
 
-        float reflVisibility = mix(0.20, 1.0, keyFace * 0.85 + 0.15) * mix(0.32, 1.0, castShadow);
-        vec3 glassReflection = studioIbl * (0.08 + 0.92 * fresnel) * 0.072 * (1.0 - frameMask * 0.82) * reflVisibility
-          + upperStripSweep;
+        float inUnitU_g = step(-0.002, vUv.x) * step(vUv.x, 1.002);
+        float facadeEdgeU = inUnitU_g * (1.0 - smoothstep(0.0, 0.14, min(vUv.x, 1.0 - vUv.x))) * uAllowSideChamfers;
+        float grazingGlass = pow(1.0 - NdotV, 5.2);
 
-        // Subtle warm-neutral directional chamfer catchlight ONLY on sunlit-facing corners
+        vec3 narrowSoftboxStreaks = STUDIO_KEY_WARM
+          * (0.14 + 0.36 * heightSheen)
+          * (narrowStreakA * uKeyIntensity + narrowStreakB * uRimIntensity * 0.75)
+          * (0.28 + 0.72 * fresnel + 0.45 * facadeEdgeU)
+          * mix(0.16, 1.0, castShadow)
+          * (1.0 - frameMask * 0.90)
+          * (1.0 - isRoof);
+
+        vec3 edgeGrazingSheen = STUDIO_PLATINUM_RIM
+          * grazingGlass
+          * (0.052 + 0.125 * facadeEdgeU)
+          * (1.0 - frameMask * 0.88)
+          * (1.0 - isRoof)
+          * (0.5 + 0.5 * uRimIntensity);
+
+        float reflVisibility = mix(0.14, 1.0, keyFace * 0.88 + 0.12) * mix(0.24, 1.0, castShadow);
+        vec3 glassReflection = studioIbl * pow(1.0 - NdotV, 3.2) * 0.042 * (1.0 - frameMask * 0.88) * reflVisibility
+          + narrowSoftboxStreaks
+          + edgeGrazingSheen;
+
+        // Razor-thin platinum edge rim glint ONLY along sharp vertical corners, setbacks & parapets
         float faceKeyVis = smoothstep(-0.08, 0.25, dot(baseN, keyL));
         float chamferKeyFacing = pow(max(dot(N, keyL), 0.0), 2.0) * castShadow * uKeyIntensity * faceKeyVis;
-        float chamferRimFacing = pow(max(dot(N, rimL), 0.0), 2.4) * uRimIntensity * 0.28 * smoothstep(-0.1, 0.25, dot(baseN, rimL));
-        vec3 chamferCatch = (STUDIO_KEY_WARM * chamferKeyFacing + vec3(0.98, 0.99, 1.02) * chamferRimFacing)
-          * chamferMask * vec3(0.24, 0.25, 0.28) * uEdgeLuminance * (0.25 + 0.35 * uIsHero + uPressDepth * 0.12);
+        vec3 chamferCatch = STUDIO_KEY_WARM * chamferKeyFacing
+          * chamferMask * vec3(0.12, 0.13, 0.15) * uEdgeLuminance * (0.25 + 0.35 * uIsHero);
+        vec3 platinumRim = computePlatinumEdgeGlint(
+          baseN,
+          N,
+          V,
+          keyL,
+          chamferMask,
+          uRimIntensity,
+          uKeyIntensity
+        ) * (0.24 + 0.12 * uIsHero) * uEdgeLuminance * (1.0 + uPressDepth * 0.12);
 
         vec3 glassLit = facadeBase * contactAo
           + glassReflection * mix(0.55, 1.0, contactAo)
           + chamferCatch
+          + platinumRim
           + vec3(0.18, 0.19, 0.22) * uHighlightBoost * 0.35;
 
-        // Dead-matte architectural slate/concrete rooftop (roughness ~0.88, receiving real-time PCF shadows)
+        // Dead-matte architectural slate/concrete rooftop (roughness ~0.88, deep obsidian, crisp parapet edge rim)
         float roofGrid = max(
           sdfGridLine(vWorldPos.x, 1.8, 0.020),
           sdfGridLine(vWorldPos.z, 1.8, 0.020)
@@ -1199,9 +1545,10 @@ export function createSdfGlassMaterial(
         float roofBevel = pow(max(dot(N, keyL), 0.0), 2.0) * castShadow * chamferMask * smoothstep(0.0, 0.4, dot(N - baseN, keyL));
 
         vec3 roofColor =
-          vec3(0.0085, 0.0089, 0.0101) * (0.88 + 0.22 * grain) * roofLit * canyonAo
+          vec3(0.0082, 0.0086, 0.0098) * (0.88 + 0.22 * grain) * roofLit * canyonAo
           + vec3(0.010) * roofGrid * mix(STUDIO_FILL_COOL * 0.28, STUDIO_KEY_WARM, castShadow) * canyonAo
-          + STUDIO_KEY_WARM * vec3(0.015, 0.015, 0.016) * roofBevel * uKeyIntensity;
+          + STUDIO_KEY_WARM * vec3(0.015, 0.015, 0.016) * roofBevel * uKeyIntensity
+          + platinumRim * 0.85;
 
         vec3 finalRgb = mix(glassLit, roofColor, isRoof);
         finalRgb = applyCanyonAtmosphere(finalRgb, vWorldPos, cameraPosition, spatialAo.g);
@@ -1342,15 +1689,26 @@ export function createAnisotropicMetalMaterial(
         vec3 V_raw = normalize(cameraPosition - vWorldPos);
         vec3 V = applySpecularParallax(V_raw, uTiltVec, uVelocity, 1.15);
 
-        vec4 chamferResult = uRadialAnisotropy > 0.5
-          ? vec4(baseN, 0.0)
-          : computeMachinedChamfer(
-              baseN,
-              vWorldPos,
-              vUv,
-              0.38,
-              uAllowSideChamfers
-            );
+        float plinthRimBand = 0.0;
+        vec4 chamferResult;
+        if (uRadialAnisotropy > 0.5) {
+          // Machined circular plinth bevel: crisp specular catchlight along the upper chamfer & rim lip
+          float radDist = length(vWorldPos.xz);
+          float upperBevelZone = smoothstep(-0.055, -0.008, vWorldPos.y)
+            * smoothstep(uBasinRadius + 0.12, uBasinRadius + 0.185, radDist);
+          float topLipZone = smoothstep(0.008, 0.026, vWorldPos.y)
+            * smoothstep(uBasinRadius + 0.11, uBasinRadius + 0.16, radDist);
+          plinthRimBand = clamp(max(upperBevelZone, topLipZone), 0.0, 1.0);
+          chamferResult = vec4(baseN, plinthRimBand);
+        } else {
+          chamferResult = computeMachinedChamfer(
+            baseN,
+            vWorldPos,
+            vUv,
+            0.38,
+            uAllowSideChamfers
+          );
+        }
         vec3 chamferShift = vec3(uTiltVec.x * 0.12, -uPressDepth * 0.10, uTiltVec.y * 0.12) * chamferResult.w;
         vec3 chamferN = normalize(chamferResult.xyz + chamferShift);
         float chamferMask = chamferResult.w;
@@ -1375,8 +1733,8 @@ export function createAnisotropicMetalMaterial(
         float NdotV = clamp(dot(N, V), 0.0, 1.0);
 
         float localRoughness = clamp(
-          uRoughness + (brush - 0.5) * 0.04 + (micro.r - 0.5) * 0.028 - chamferMask * 0.035,
-          0.18,
+          uRoughness + (brush - 0.5) * 0.04 + (micro.r - 0.5) * 0.028 - chamferMask * 0.045,
+          0.16,
           0.52
         );
 
@@ -1411,9 +1769,9 @@ export function createAnisotropicMetalMaterial(
         );
 
         float baseAo = uRadialAnisotropy > 0.5
-          ? 1.0
+          ? mix(0.66 - uPressDepth * 0.10, 1.0, smoothstep(-0.44, -0.28, vWorldPos.y))
           : mix(0.42 - uPressDepth * 0.14, 1.0, pow(smoothstep(0.06, 0.42, vWorldPos.y), 1.0 + uPressDepth * 0.50));
-        float specScale = uRadialAnisotropy > 0.5 ? 0.065 : 0.42;
+        float specScale = uRadialAnisotropy > 0.5 ? 0.14 : 0.42;
 
         float fresnel = fresnelSchlick(NdotV, 0.58);
         // Strong 3:1 key-to-fill directional shading with subtle warm key / cool shadow tint
@@ -1429,13 +1787,42 @@ export function createAnisotropicMetalMaterial(
         float chamferKeyFacing = pow(max(dot(N, keyL), 0.0), 2.0) * castShadow * uKeyIntensity * faceKeyVis;
         float chamferRimFacing = pow(max(dot(N, rimL), 0.0), 2.2) * uRimIntensity * 0.32 * smoothstep(-0.1, 0.25, dot(baseN, rimL));
 
+        // Additional crisp machined edge sheen on the anodized plinth bevel facing the key light
+        float plinthRadialKey = 0.0;
+        if (uRadialAnisotropy > 0.5 && plinthRimBand > 0.01) {
+          vec2 radDir = normalize(vWorldPos.xz + vec2(1e-5));
+          float keyArc = smoothstep(-0.15, 0.65, dot(radDir, normalize(keyL.xz)));
+          vec3 H_plinth = normalize(keyL + V);
+          float bevelSpec = pow(max(dot(N, H_plinth), 0.0), 38.0);
+          plinthRadialKey = plinthRimBand * (0.28 * keyArc + 0.72 * bevelSpec) * uKeyIntensity;
+        }
+
         vec3 metalAlbedo = uBaseColor * (0.88 + 0.24 * brush) * (0.94 + 0.12 * grain);
         vec3 color = metalAlbedo * diffuseRgb * baseAo
           + STUDIO_KEY_WARM * vec3(0.84, 0.86, 0.89) * (anisoSpec * 0.22 * baseAo * specScale)
           + iblSpec * (0.04 + 0.14 * fresnel) * baseAo * specScale * mix(0.45, 1.0, castShadow)
-          + (STUDIO_KEY_WARM * chamferKeyFacing + vec3(0.98, 0.99, 1.02) * chamferRimFacing) * chamferMask * vec3(0.24, 0.25, 0.28) * (1.0 + uPressDepth * 0.2) * specScale;
+          + (STUDIO_KEY_WARM * chamferKeyFacing + vec3(0.98, 0.99, 1.02) * chamferRimFacing) * chamferMask * vec3(0.24, 0.25, 0.28) * (1.0 + uPressDepth * 0.2) * specScale
+          + STUDIO_KEY_WARM * vec3(0.105, 0.108, 0.116) * plinthRadialKey;
 
         if (uRadialAnisotropy < 0.5) {
+          vec3 platinumRim = computePlatinumEdgeGlint(
+            baseN,
+            chamferN,
+            V,
+            keyL,
+            chamferMask,
+            uRimIntensity,
+            uKeyIntensity
+          );
+          color += platinumRim * 0.22 * baseAo;
+
+          // Subtle warm champagne-amber under-glow on recessed underside of Battery Maritime / Sails arches
+          float inArchZone = step(4.6, vWorldPos.x) * step(vWorldPos.x, 10.2)
+            * step(0.95, vWorldPos.y) * step(vWorldPos.y, 1.82)
+            * step(-1.1, vWorldPos.z) * step(vWorldPos.z, 1.9);
+          float undersideMask = smoothstep(0.18, -0.45, baseN.y) * inArchZone;
+          color += STUDIO_WARM_POOL_3000K * undersideMask * 0.052;
+
           vec2 spatialAo = sampleUrbanSpatialAo(uGroundAoMap, vWorldPos.xz, uBasinRadius);
           color = applyCanyonAtmosphere(color, vWorldPos, cameraPosition, spatialAo.g);
         }
@@ -1454,6 +1841,7 @@ export function createAnisotropicMetalMaterial(
 export function createCycloramaFloorMaterial(
   grainTexture: THREE.Texture,
   basinRadius: number,
+  microImperfectionMap: THREE.Texture,
 ): THREE.ShaderMaterial {
   return new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
@@ -1461,6 +1849,7 @@ export function createCycloramaFloorMaterial(
     depthWrite: false,
     uniforms: {
       uGrainMap: { value: grainTexture },
+      uMicroMap: { value: microImperfectionMap },
       uBasinRadius: { value: basinRadius },
       uSoftboxKeyDir: { value: new THREE.Vector3(-0.44, 0.68, 0.58) },
       uKeyIntensity: { value: 1.26 },
@@ -1481,6 +1870,7 @@ export function createCycloramaFloorMaterial(
     `,
     fragmentShader: /* glsl */ `
       uniform sampler2D uGrainMap;
+      uniform sampler2D uMicroMap;
       uniform float uBasinRadius;
       uniform vec3 uSoftboxKeyDir;
       uniform float uKeyIntensity;
@@ -1498,44 +1888,61 @@ export function createCycloramaFloorMaterial(
         float plinthR = uBasinRadius + 0.34;
         float dist = length(p);
 
-        // Seamless radial cyclorama fade into exact studio background (#131315 linear ~0.0052)
-        float outerFade = smoothstep(plinthR + 0.8, plinthR + 7.2, dist);
+        // Seamless radial cyclorama fade into transparent page studio backdrop (zero rectangular seam)
+        float outerFade = smoothstep(plinthR + 0.20, plinthR + 4.8, dist);
         if (outerFade >= 0.999) {
           discard;
         }
 
-        // Subtle studio tabletop cyclorama sweep (slightly brighter under upper-left key pool)
+        // Subtle bead-blasted dark slate tabletop micro-grain & key-light softbox pool
         vec3 keyL = normalize(uSoftboxKeyDir);
         vec2 keyHoriz = normalize(keyL.xz);
-        float keyPool = smoothstep(20.0, -8.0, dot(p, -keyHoriz));
-        float centerPool = exp(-pow(dist / (plinthR * 1.38), 2.0));
-        float fineGrain = texture(uGrainMap, p * 0.25).r;
+        float keyPool = smoothstep(18.0, -8.0, dot(p, -keyHoriz));
+        float centerPool = exp(-pow(dist / (plinthR * 1.22), 2.0));
+        float fineGrain = texture(uGrainMap, p * 0.48).r;
+        vec3 beadGrain = texture(uMicroMap, p * 1.65).rgb;
+        float slateMicro = (beadGrain.r - 0.5) * 0.14 + (fineGrain - 0.5) * 0.12;
 
-        vec3 bgLinear = vec3(0.0046, 0.0046, 0.0054);
+        vec3 studioBase = vec3(0.0046, 0.0048, 0.0055);
         vec3 tabletopLit = mix(
-          bgLinear,
-          vec3(0.0175, 0.0180, 0.0205),
-          centerPool * (0.52 + 0.48 * keyPool) * (0.72 + 0.28 * uKeyIntensity)
-        ) * (0.95 + 0.10 * fineGrain);
+          studioBase,
+          vec3(0.0158, 0.0164, 0.0190),
+          centerPool * (0.42 + 0.58 * keyPool) * (0.72 + 0.28 * uKeyIntensity)
+        ) * (1.0 + slateMicro);
 
-        // 1. Tight omnidirectional contact occlusion directly under the beveled plinth base
-        float tightRimDist = max(0.0, dist - (plinthR - 0.12));
-        float tightContactAo = 1.0 - exp(-tightRimDist * 2.1) * (0.88 + uPressDepth * 0.10);
+        // 1. Tight ~1px dark ambient occlusion crevice directly under the metal plinth rim
+        float creviceDist = max(0.0, dist - (plinthR - 0.02));
+        float tightRimCrevice = 1.0 - exp(-pow(creviceDist / 0.045, 1.15)) * (0.96 + uPressDepth * 0.03);
+        float nearFootAo = 1.0 - exp(-creviceDist * 3.2) * 0.62;
+        float tightContactAo = min(tightRimCrevice, nearFootAo);
 
-        // 2. Soft asymmetrical oval key-cast shadow shifted opposite uSoftboxKeyDir.xz
-        vec2 shadowShift = -keyHoriz * (1.35 + (1.0 - clamp(keyL.y, 0.25, 0.9)) * 1.45);
+        // 2. Soft directional tabletop shadow cast toward the lower-right (opposite upper-left key light)
+        vec2 shadowShift = -keyHoriz * (1.28 + (1.0 - clamp(keyL.y, 0.25, 0.85)) * 1.38);
         vec2 rel = p - shadowShift;
         float along = dot(rel, keyHoriz) / (plinthR * 1.08);
         vec2 perpVec = vec2(-keyHoriz.y, keyHoriz.x);
         float across = dot(rel, perpVec) / (plinthR * 1.01);
         float ovalDist = sqrt(along * along + across * across);
-        float ovalPenumbra = 1.0 - smoothstep(0.86, 1.24, ovalDist) * 0.82;
-        float castShadowMask = mix(1.0, 0.14, 1.0 - ovalPenumbra);
+        float ovalPenumbra = 1.0 - smoothstep(0.82, 1.22, ovalDist) * 0.88;
+        float castShadowMask = mix(1.0, 0.09, 1.0 - ovalPenumbra);
+
+        // 3. Faint specular bounce of the brushed silver plinth edge onto the tabletop right outside its rim
+        vec2 radDir = dist > 0.001 ? p / dist : vec2(0.0, 1.0);
+        float rimBounceArc = smoothstep(-0.35, 0.72, dot(radDir, keyHoriz));
+        float bounceBand = exp(-pow(max(0.0, dist - (plinthR + 0.045)) / 0.16, 2.0)) * step(plinthR - 0.01, dist);
+        float microGlint = 0.78 + 0.44 * beadGrain.g;
+        vec3 plinthSilverBounce = vec3(0.018, 0.019, 0.021)
+          * bounceBand
+          * (0.28 + 0.72 * rimBounceArc)
+          * microGlint
+          * uKeyIntensity
+          * (1.0 + uPressDepth * 0.25);
 
         float totalShadow = min(tightContactAo, castShadowMask);
-        vec3 groundedFloor = mix(tabletopLit * totalShadow, bgLinear, outerFade);
+        vec3 groundedFloor = mix(tabletopLit * totalShadow + plinthSilverBounce, studioBase, outerFade * 0.72);
+        float alpha = (1.0 - outerFade) * 0.94;
 
-        fragColor = vec4(groundedFloor, 1.0 - outerFade);
+        fragColor = vec4(groundedFloor, alpha);
       }
     `,
   });
