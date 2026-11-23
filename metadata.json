@@ -1,0 +1,6 @@
+{
+  "name": "Promptworks Studio™",
+  "description": "Independent web design, art direction, and procedural WebGL2 architectural practice based in San Diego, CA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

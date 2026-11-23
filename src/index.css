@@ -1,0 +1,133 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    background-color: #111113;
+    color: #f4f4f5;
+    font-family: var(--font-sans);
+  }
+
+  body {
+    overflow-x: hidden;
+    background-color: #111113;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .hw-control,
+  .hw-card,
+  .hw-panel {
+    transform: translate3d(0, calc(var(--hw-press, 0) * 1.5px), 0) !important;
+  }
+}
+
+/* Tactile physical hardware surfaces driven by rAF RK4 damped springs */
+.hw-control {
+  --hw-press: 0;
+  --hw-hover: 0;
+  --hw-tilt-x: 0;
+  --hw-tilt-y: 0;
+  --hw-z: 0px;
+  --hw-shadow-y: 7px;
+  --hw-shadow-blur: 16px;
+  --hw-ao-alpha: 0.34;
+  --hw-chamfer-angle: 135deg;
+  --hw-bounce-glow: 0;
+
+  position: relative;
+  transform: perspective(680px)
+    translate3d(0, calc(var(--hw-z) * -1), 0)
+    rotateX(calc(var(--hw-tilt-x) * 1deg))
+    rotateY(calc(var(--hw-tilt-y) * 1deg));
+  box-shadow:
+    0 var(--hw-shadow-y) var(--hw-shadow-blur) rgba(0, 0, 0, var(--hw-ao-alpha)),
+    inset 0 1px 0 rgba(255, 255, 255, calc(0.11 + var(--hw-hover) * 0.14 - var(--hw-press) * 0.08)),
+    inset 0 -1px 0 rgba(0, 0, 0, calc(0.32 + var(--hw-press) * 0.32)),
+    0 0 20px rgba(244, 244, 245, calc(var(--hw-bounce-glow) * 0.38));
+  background-image: linear-gradient(
+    var(--hw-chamfer-angle),
+    rgba(255, 255, 255, calc(0.03 + var(--hw-hover) * 0.05 + var(--hw-press) * 0.06)) 0%,
+    transparent 52%,
+    rgba(0, 0, 0, calc(0.06 + var(--hw-press) * 0.10)) 100%
+  );
+  will-change: transform, box-shadow;
+}
+
+.hw-card {
+  --hw-press: 0;
+  --hw-hover: 0;
+  --hw-tilt-x: 0;
+  --hw-tilt-y: 0;
+  --hw-z: 0px;
+  --hw-shadow-y: 14px;
+  --hw-shadow-blur: 26px;
+  --hw-ao-alpha: 0.36;
+  --hw-chamfer-angle: var(--hw-global-chamfer, 135deg);
+  --hw-bounce-glow: 0;
+
+  transform: perspective(1000px)
+    translate3d(0, calc(var(--hw-z) * -1), 0)
+    rotateX(calc(var(--hw-tilt-x) * 1deg))
+    rotateY(calc(var(--hw-tilt-y) * 1deg));
+  box-shadow:
+    0 var(--hw-shadow-y) var(--hw-shadow-blur) rgba(0, 0, 0, var(--hw-ao-alpha)),
+    inset 0 1px 0 rgba(255, 255, 255, calc(0.06 + var(--hw-hover) * 0.12)),
+    0 0 28px rgba(244, 244, 245, calc(var(--hw-bounce-glow) * 0.14));
+  background-image: linear-gradient(
+    var(--hw-chamfer-angle),
+    rgba(255, 255, 255, calc(0.015 + var(--hw-hover) * 0.035)) 0%,
+    transparent 45%
+  );
+  will-change: transform, box-shadow;
+}
+
+.hw-panel {
+  --hw-press: 0;
+  --hw-hover: 0;
+  --hw-tilt-x: 0;
+  --hw-tilt-y: 0;
+  --hw-z: 0px;
+  --hw-shadow-y: 26px;
+  --hw-shadow-blur: 48px;
+  --hw-ao-alpha: 0.56;
+  --hw-chamfer-angle: var(--hw-global-chamfer, 135deg);
+  --hw-bounce-glow: 0.06;
+
+  transform: perspective(1200px)
+    translate3d(0, calc(var(--hw-press) * 2px), 0)
+    rotateX(calc(var(--hw-tilt-x) * 0.65deg))
+    rotateY(calc(var(--hw-tilt-y) * 0.65deg));
+  box-shadow:
+    0 var(--hw-shadow-y) var(--hw-shadow-blur) rgba(0, 0, 0, var(--hw-ao-alpha)),
+    inset 0 1px 0 rgba(255, 255, 255, calc(0.10 + var(--hw-hover) * 0.08)),
+    0 0 36px rgba(255, 255, 255, calc(var(--hw-bounce-glow) * 0.12));
+  background-image: linear-gradient(
+    var(--hw-chamfer-angle),
+    rgba(255, 255, 255, 0.028) 0%,
+    transparent 48%
+  );
+  will-change: transform, box-shadow;
+}
+
+.hw-text-trigger {
+  --hw-press: 0;
+  --hw-hover: 0;
+  --hw-z: 0px;
+  --hw-bounce-glow: 0;
+
+  transform: translate3d(0, calc(var(--hw-z) * -1), 0);
+  text-shadow: 0 0 14px rgba(244, 244, 245, calc(var(--hw-bounce-glow) * 0.75));
+  will-change: transform;
+}
